@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserdata
+xcuserdata/
+.DS_Store
+*.key
+*.p12
+*.hash
+*.keychain
+certs/
+ntlm/
+.swift-rdp.local.env
