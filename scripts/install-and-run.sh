@@ -130,14 +130,10 @@ if [[ "$CONFIG" == "release" ]]; then
   swift build -c release --product SwiftRDPApp
   BIN="$ROOT/.build/release/SwiftRDPApp"
   BUNDLE_SRC="$ROOT/.build/release/SwiftRDP_SwiftRDPApp.bundle"
-  [[ -x "$ROOT/.build/arm64-apple-macosx/release/SwiftRDPApp" ]] && BIN="$ROOT/.build/arm64-apple-macosx/release/SwiftRDPApp"
-  [[ -d "$ROOT/.build/arm64-apple-macosx/release/SwiftRDP_SwiftRDPApp.bundle" ]] && BUNDLE_SRC="$ROOT/.build/arm64-apple-macosx/release/SwiftRDP_SwiftRDPApp.bundle"
 else
   swift build --product SwiftRDPApp
   BIN="$ROOT/.build/debug/SwiftRDPApp"
   BUNDLE_SRC="$ROOT/.build/debug/SwiftRDP_SwiftRDPApp.bundle"
-  [[ -x "$ROOT/.build/arm64-apple-macosx/debug/SwiftRDPApp" ]] && BIN="$ROOT/.build/arm64-apple-macosx/debug/SwiftRDPApp"
-  [[ -d "$ROOT/.build/arm64-apple-macosx/debug/SwiftRDP_SwiftRDPApp.bundle" ]] && BUNDLE_SRC="$ROOT/.build/arm64-apple-macosx/debug/SwiftRDP_SwiftRDPApp.bundle"
 fi
 
 [[ -x "$BIN" ]] || BIN="$ROOT/.build/$CONFIG/SwiftRDPApp"
