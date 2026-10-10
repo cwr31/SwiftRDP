@@ -9,6 +9,8 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         public var averageRTTMs: UInt32 = 0
         /// Kilobits per second. Zero means that no valid bandwidth sample exists.
         public var bandwidthKbps: UInt32 = 0
+        public var rttMeasuredAtNanoseconds: UInt64 = 0
+        public var bandwidthMeasuredAtNanoseconds: UInt64 = 0
         public var hasRTT: Bool { averageRTTMs > 0 || baseRTTMs > 0 }
         public var hasBandwidth: Bool { bandwidthKbps > 0 }
     }
@@ -19,7 +21,6 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         case connectBandwidth
         case complete
         case continuousRTT
-        case continuousBandwidth
     }
 
     private let lock = NSLock()
@@ -28,13 +29,11 @@ public final class NetworkAutoDetect: @unchecked Sendable {
     private var onSendHandler: (([UInt8]) -> Void)?
     private var onConnectTimeFinishedHandler: (() -> Void)?
     private var onMetricsUpdatedHandler: ((Metrics) -> Void)?
-    private var shouldDeferContinuousBandwidthHandler: (() -> Bool)?
 
     private var sequence: UInt16 = 0x20
-    private var rttStartedAt: Date?
+    private var rttStartedAtNanoseconds: UInt64?
     private var pendingRTTSequence: UInt16?
     private var pendingBWSequence: UInt16?
-    private var lastResultSequence: UInt16?
     private var connectTimeFinished = false
     private var operationGeneration: UInt64 = 0
     private var continuousGeneration: UInt64 = 0
@@ -42,15 +41,13 @@ public final class NetworkAutoDetect: @unchecked Sendable {
     private var continuousTask: Task<Void, Never>?
 
     /// Connect-time probes deliberately use a payload so the client can measure
-    /// a sub-millisecond LAN path. Continuous probes measure existing traffic.
+    /// a sub-millisecond LAN path. Continuous RTT probes do not add bulk traffic.
     private static let connectPayloadCount = 48
     private static let connectPayloadBytes: UInt16 = 4096
-    private static let connectTimeoutNs: UInt64 = 3_000_000_000
+    private static let connectRTTTimeoutNs: UInt64 = 3_000_000_000
+    private static let connectBWTimeoutNs: UInt64 = 5_000_000_000
     private static let continuousRTTIntervalNs: UInt64 = 15_000_000_000
     private static let continuousRTTTimeoutNs: UInt64 = 3_000_000_000
-    private static let continuousBWIntervalNs: UInt64 = 45_000_000_000
-    private static let continuousBWIntervalWhenHotNs: UInt64 = 90_000_000_000
-    private static let continuousBWWindowNs: UInt64 = 1_000_000_000
 
     public init() {}
 
@@ -80,11 +77,6 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         set { locked { onMetricsUpdatedHandler = newValue } }
     }
 
-    public var shouldDeferContinuousBandwidth: (() -> Bool)? {
-        get { locked { shouldDeferContinuousBandwidthHandler } }
-        set { locked { shouldDeferContinuousBandwidthHandler = newValue } }
-    }
-
     public var isConnectTimeInFlight: Bool {
         locked { phaseValue == .connectRTT || phaseValue == .connectBandwidth }
     }
@@ -99,7 +91,7 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             let sequence = nextSequenceLocked()
             phaseValue = .connectRTT
             pendingRTTSequence = sequence
-            rttStartedAt = Date()
+            rttStartedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
             return (
                 sequence,
                 AutoDetectPDU.encodeRTTRequest(
@@ -110,8 +102,8 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             )
         }
         guard let request else { return }
+        armConnectTimeout(generation: request.generation, timeoutNs: Self.connectRTTTimeoutNs)
         send(request.pdu)
-        armConnectTimeout(generation: request.generation)
         RDPLog.rdp.info("AutoDetect: connect-time RTT request seq=\(request.sequence)")
     }
 
@@ -126,7 +118,6 @@ public final class NetworkAutoDetect: @unchecked Sendable {
 
         let task = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
-            var lastBandwidthProbe = Date.distantPast
             while !Task.isCancelled {
                 guard let self, self.isContinuousGeneration(generation) else { return }
                 self.startContinuousRTT()
@@ -138,24 +129,6 @@ public final class NetworkAutoDetect: @unchecked Sendable {
                 try? await Task.sleep(nanoseconds: Self.continuousRTTIntervalNs - Self.continuousRTTTimeoutNs)
                 guard !Task.isCancelled, self.isContinuousGeneration(generation) else { return }
 
-                let desktopHot = self.shouldDeferBandwidth()
-                let interval = desktopHot
-                    ? Self.continuousBWIntervalWhenHotNs
-                    : Self.continuousBWIntervalNs
-                let enoughTimePassed = Date().timeIntervalSince(lastBandwidthProbe)
-                    >= TimeInterval(interval) / 1_000_000_000
-                if enoughTimePassed, !desktopHot,
-                   let sequence = self.startContinuousBandwidth() {
-                    lastBandwidthProbe = Date()
-                    try? await Task.sleep(nanoseconds: Self.continuousBWWindowNs)
-                    guard !Task.isCancelled, self.isContinuousGeneration(generation) else { return }
-                    self.stopContinuousBandwidth(sequence: sequence)
-                    try? await Task.sleep(nanoseconds: Self.continuousRTTTimeoutNs)
-                    guard !Task.isCancelled, self.isContinuousGeneration(generation) else { return }
-                    self.expireContinuousBandwidth(sequence: sequence)
-                } else if desktopHot {
-                    RDPLog.rdp.debug("AutoDetect: defer continuous BW probe (desktop hot)")
-                }
             }
         }
 
@@ -177,8 +150,7 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             phaseValue = .idle
             pendingRTTSequence = nil
             pendingBWSequence = nil
-            rttStartedAt = nil
-            lastResultSequence = nil
+            rttStartedAtNanoseconds = nil
             return tasks
         }
         tasks.0?.cancel()
@@ -213,19 +185,20 @@ public final class NetworkAutoDetect: @unchecked Sendable {
     // MARK: - Probe responses
 
     private func handleRTTResponse(sequence: UInt16) {
-        let action: (metrics: Metrics, connect: Bool, bandwidthPDUs: [[UInt8]])? = locked {
+        let action: (metrics: Metrics, connect: Bool, generation: UInt64, bandwidthPDUs: [[UInt8]])? = locked {
             guard pendingRTTSequence == sequence,
-                  let started = rttStartedAt,
+                  let started = rttStartedAtNanoseconds,
                   phaseValue == .connectRTT || phaseValue == .continuousRTT
             else { return nil }
 
-            let elapsedMs = max(1, Int(Date().timeIntervalSince(started) * 1000))
+            let elapsedMs = max(1, Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000))
             pendingRTTSequence = nil
-            rttStartedAt = nil
+            rttStartedAtNanoseconds = nil
             applyRTTLocked(UInt32(min(elapsedMs, Int(UInt32.max))))
 
             if phaseValue == .connectRTT {
                 phaseValue = .connectBandwidth
+                operationGeneration &+= 1
                 let sequence = nextSequenceLocked()
                 pendingBWSequence = sequence
                 var pdus = [AutoDetectPDU.encodeBandwidthStart(
@@ -243,23 +216,22 @@ public final class NetworkAutoDetect: @unchecked Sendable {
                     sequenceNumber: sequence,
                     connectTime: true
                 ))
-                return (metricsValue, true, pdus)
+                return (metricsValue, true, operationGeneration, pdus)
             }
 
             phaseValue = .complete
-            return (metricsValue, false, [])
+            return (metricsValue, false, operationGeneration, [])
         }
         guard let action else { return }
 
         notifyMetrics(action.metrics)
         if action.connect {
+            armConnectTimeout(generation: action.generation, timeoutNs: Self.connectBWTimeoutNs)
             sendAll(action.bandwidthPDUs)
             RDPLog.rdp.info(
                 "AutoDetect: connect-time BW probe payloads=" +
                     "\(Self.connectPayloadCount)x\(Self.connectPayloadBytes)B"
             )
-        } else {
-            publishNetCharResult()
         }
     }
 
@@ -269,29 +241,27 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         timeDeltaMs: UInt32,
         byteCount: UInt32
     ) {
-        let action: (metrics: Metrics, connect: Bool)? = locked {
-            let connect = phaseValue == .connectBandwidth
-                && responseType == AutoDetectPDU.bwResultsConnectTime
-            let continuous = phaseValue == .continuousBandwidth
-                && responseType == AutoDetectPDU.bwResultsContinuous
-            guard pendingBWSequence == sequence, connect || continuous else { return nil }
+        let updated: Metrics? = locked {
+            guard phaseValue == .connectBandwidth,
+                  responseType == AutoDetectPDU.bwResultsConnectTime,
+                  pendingBWSequence == sequence else { return nil }
 
             pendingBWSequence = nil
-            if continuous { phaseValue = .complete }
 
             let kbps = AutoDetectPDU.bandwidthKbps(
                 timeDeltaMs: timeDeltaMs,
                 byteCount: byteCount
             )
             if kbps > 0 {
+                metricsValue.bandwidthMeasuredAtNanoseconds = DispatchTime.now().uptimeNanoseconds
                 let previous = metricsValue.bandwidthKbps
                 metricsValue.bandwidthKbps = previous == 0
                     ? kbps
                     : UInt32((Double(previous) * 0.75 + Double(kbps) * 0.25).rounded())
             }
-            return (metricsValue, connect)
+            return metricsValue
         }
-        guard let action else { return }
+        guard let updated else { return }
 
         let kbps = AutoDetectPDU.bandwidthKbps(
             timeDeltaMs: timeDeltaMs,
@@ -301,10 +271,9 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             "AutoDetect: BW results type=0x\(String(responseType, radix: 16)) " +
                 "delta=\(timeDeltaMs)ms bytes=\(byteCount) -> \(kbps)kbps"
         )
+        notifyMetrics(updated)
         publishNetCharResult()
-        if action.connect {
-            finishConnectTime(publish: false)
-        }
+        finishConnectTime(publish: false)
     }
 
     private func handleNetCharSync(
@@ -312,32 +281,30 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         bandwidthKbps: UInt32,
         rttMs: UInt32
     ) {
-        let action: (metrics: Metrics, connect: Bool)? = locked {
+        let updated: Metrics? = locked {
             let matchesCurrentProbe = sequence == pendingRTTSequence
                 || sequence == pendingBWSequence
-            let matchesPublishedResult = pendingRTTSequence == nil
-                && pendingBWSequence == nil
-                && sequence == lastResultSequence
-            guard phaseValue != .idle,
-                  matchesCurrentProbe || matchesPublishedResult
+            guard phaseValue == .connectRTT || phaseValue == .connectBandwidth,
+                  matchesCurrentProbe
             else { return nil }
 
-            let connect = phaseValue == .connectRTT || phaseValue == .connectBandwidth
-            lastResultSequence = nil
-            if bandwidthKbps > 0 { metricsValue.bandwidthKbps = bandwidthKbps }
+            if bandwidthKbps > 0 {
+                metricsValue.bandwidthKbps = bandwidthKbps
+                metricsValue.bandwidthMeasuredAtNanoseconds = DispatchTime.now().uptimeNanoseconds
+            }
             if rttMs > 0 {
+                metricsValue.rttMeasuredAtNanoseconds = DispatchTime.now().uptimeNanoseconds
                 metricsValue.baseRTTMs = rttMs
                 metricsValue.averageRTTMs = rttMs
             }
             pendingRTTSequence = nil
             pendingBWSequence = nil
-            rttStartedAt = nil
-            if !connect { phaseValue = .complete }
-            return (metricsValue, connect)
+            rttStartedAtNanoseconds = nil
+            return metricsValue
         }
-        guard let action else { return }
-        if action.connect { finishConnectTime(publish: false) }
-        notifyMetrics(action.metrics)
+        guard let updated else { return }
+        finishConnectTime(publish: false)
+        notifyMetrics(updated)
         RDPLog.rdp.info(
             "AutoDetect: client NETCHAR sync bw=\(bandwidthKbps)kbps rtt=\(rttMs)ms"
         )
@@ -351,7 +318,7 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             let sequence = nextSequenceLocked()
             phaseValue = .continuousRTT
             pendingRTTSequence = sequence
-            rttStartedAt = Date()
+            rttStartedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
             return (
                 sequence,
                 AutoDetectPDU.encodeRTTRequest(
@@ -370,54 +337,7 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             guard phaseValue == .continuousRTT else { return }
             phaseValue = .complete
             pendingRTTSequence = nil
-            rttStartedAt = nil
-        }
-    }
-
-    private func startContinuousBandwidth() -> UInt16? {
-        let request: (UInt16, [UInt8])? = locked {
-            guard phaseValue == .idle || phaseValue == .complete else { return nil }
-            let sequence = nextSequenceLocked()
-            phaseValue = .continuousBandwidth
-            pendingBWSequence = sequence
-            return (
-                sequence,
-                AutoDetectPDU.encodeBandwidthStart(
-                    sequenceNumber: sequence,
-                    connectTime: false
-                )
-            )
-        }
-        guard let request else { return nil }
-        send(request.1)
-        RDPLog.rdp.debug(
-            "AutoDetect: continuous BW window start seq=\(request.0) " +
-                "(existing traffic only)"
-        )
-        return request.0
-    }
-
-    private func stopContinuousBandwidth(sequence: UInt16) {
-        let pdu: [UInt8]? = locked {
-            guard phaseValue == .continuousBandwidth,
-                  pendingBWSequence == sequence
-            else { return nil }
-            return AutoDetectPDU.encodeBandwidthStop(
-                sequenceNumber: sequence,
-                connectTime: false
-            )
-        }
-        guard let pdu else { return }
-        send(pdu)
-    }
-
-    private func expireContinuousBandwidth(sequence: UInt16) {
-        locked {
-            guard phaseValue == .continuousBandwidth,
-                  pendingBWSequence == sequence
-            else { return }
-            phaseValue = .complete
-            pendingBWSequence = nil
+            rttStartedAtNanoseconds = nil
         }
     }
 
@@ -449,17 +369,13 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         handler?(metrics)
     }
 
-    private func shouldDeferBandwidth() -> Bool {
-        let handler = locked { shouldDeferContinuousBandwidthHandler }
-        return handler?() == true
-    }
-
     private func isContinuousGeneration(_ generation: UInt64) -> Bool {
         locked { continuousGeneration == generation }
     }
 
     private func applyRTTLocked(_ ms: UInt32) {
         guard ms > 0 else { return }
+        metricsValue.rttMeasuredAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         metricsValue.averageRTTMs = metricsValue.averageRTTMs == 0
             ? ms
             : UInt32((Double(metricsValue.averageRTTMs) * 0.8 + Double(ms) * 0.2).rounded())
@@ -468,9 +384,9 @@ public final class NetworkAutoDetect: @unchecked Sendable {
         }
     }
 
-    private func armConnectTimeout(generation: UInt64) {
+    private func armConnectTimeout(generation: UInt64, timeoutNs: UInt64) {
         let task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.connectTimeoutNs)
+            try? await Task.sleep(nanoseconds: timeoutNs)
             guard !Task.isCancelled, let self else { return }
             let shouldFinish = self.locked {
                 self.operationGeneration == generation
@@ -482,11 +398,19 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             }
         }
         let oldTask = locked {
+            guard operationGeneration == generation, isConnectPhaseLocked else {
+                task.cancel()
+                return nil as Task<Void, Never>?
+            }
             let oldTask = timeoutTask
             timeoutTask = task
             return oldTask
         }
         oldTask?.cancel()
+    }
+
+    private var isConnectPhaseLocked: Bool {
+        phaseValue == .connectRTT || phaseValue == .connectBandwidth
     }
 
     private func finishConnectTime(publish: Bool) {
@@ -498,7 +422,7 @@ public final class NetworkAutoDetect: @unchecked Sendable {
             phaseValue = .complete
             pendingRTTSequence = nil
             pendingBWSequence = nil
-            rttStartedAt = nil
+            rttStartedAtNanoseconds = nil
             return (
                 publish && (metricsValue.hasRTT || metricsValue.hasBandwidth),
                 onConnectTimeFinishedHandler
@@ -520,28 +444,23 @@ public final class NetworkAutoDetect: @unchecked Sendable {
     }
 
     private func publishNetCharResult() {
-        let result: (pdu: [UInt8], metrics: Metrics)? = locked {
+        let pdu: [UInt8]? = locked {
             guard metricsValue.hasRTT || metricsValue.hasBandwidth else { return nil }
             let sequence = nextSequenceLocked()
-            lastResultSequence = sequence
             let base = metricsValue.baseRTTMs > 0
                 ? metricsValue.baseRTTMs
                 : metricsValue.averageRTTMs
             let average = metricsValue.averageRTTMs > 0
                 ? metricsValue.averageRTTMs
                 : base
-            return (
-                AutoDetectPDU.encodeNetCharResult(
+            return AutoDetectPDU.encodeNetCharResult(
                     sequenceNumber: sequence,
                     baseRTTMs: base,
                     bandwidthKbps: metricsValue.bandwidthKbps,
                     averageRTTMs: average
-                ),
-                metricsValue
-            )
+                )
         }
-        guard let result else { return }
-        send(result.pdu)
-        notifyMetrics(result.metrics)
+        guard let pdu else { return }
+        send(pdu)
     }
 }

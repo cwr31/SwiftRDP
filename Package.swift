@@ -66,7 +66,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftRDPCoreTests",
-            dependencies: ["SwiftRDPCore"],
+            dependencies: [
+                "SwiftRDPCore",
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+            ],
             path: "Tests/SwiftRDPCoreTests",
             resources: [
                 .copy("Fixtures/real-video-stats.log"),

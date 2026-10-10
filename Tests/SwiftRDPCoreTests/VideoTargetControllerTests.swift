@@ -51,7 +51,7 @@ final class VideoTargetControllerTests: XCTestCase {
         )
 
         XCTAssertNil(controller.lastClientQueueDelayMs)
-        XCTAssertEqual(controller.perfSnapshot.quality.clientQueue, .unavailable)
+        XCTAssertEqual(controller.performanceSnapshot().quality.clientQueue, .unavailable)
     }
 
     func testClientQueuePressureDoesNotReduceNetworkBitrate() {
@@ -82,8 +82,8 @@ final class VideoTargetControllerTests: XCTestCase {
 
         XCTAssertLessThan(controller.targetFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
-        XCTAssertEqual(controller.perfSnapshot.pressureSource, .clientQueue)
-        XCTAssertEqual(controller.perfSnapshot.networkPressure, 0, accuracy: 0.01)
+        XCTAssertEqual(controller.performanceSnapshot().pressureSource, .clientQueue)
+        XCTAssertEqual(controller.performanceSnapshot().networkPressure, 0, accuracy: 0.01)
     }
 
     func testServerQueueUsesTimeBudgetAndReducesNetworkLoad() {
@@ -98,38 +98,40 @@ final class VideoTargetControllerTests: XCTestCase {
         controller.noteServerQueue(bytes: queuedBytes, now: start.addingTimeInterval(0.6))
 
         XCTAssertLessThan(controller.targetFPS, 60)
-        XCTAssertEqual(controller.targetBitrate, 20_000_000)
-        XCTAssertEqual(controller.perfSnapshot.pressureSource, .serverQueue)
+        XCTAssertEqual(controller.targetBitrate, 17_000_000)
+        XCTAssertEqual(controller.performanceSnapshot().pressureSource, .serverQueue)
     }
 
-    func testLiveAckRateOverridesStaleAutoDetectRateForQueueDelay() {
+    func testBackloggedAckSamplesOverrideAutoDetectRateForQueueDelay() {
         let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
         let start = Date()
-        controller.seedFromAutoDetect(bandwidthKbps: 100_000, rttMs: 10, now: start)
+        seed(controller, bandwidthKbps: 100_000, rttMs: 10, now: start)
         controller.noteServerQueue(bytes: 500_000, now: start)
 
-        controller.noteFrameAck(
-            clientQueue: .unavailable,
-            ackLatencyMs: 10,
-            unacked: 0,
-            acknowledgedBytes: 25_000,
-            acknowledgedFrames: 1,
-            acknowledgementIntervalMs: 100,
-            now: start.addingTimeInterval(1)
-        )
-        controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(1))
+        for index in 0..<3 {
+            controller.noteFrameAck(
+                clientQueue: .unavailable,
+                ackLatencyMs: 10,
+                unacked: 1,
+                acknowledgedBytes: 25_000,
+                acknowledgementIntervalMs: 100,
+                isApplicationLimited: false,
+                now: start.addingTimeInterval(1 + Double(index) * 0.1)
+            )
+        }
+        controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(1.2))
 
         XCTAssertGreaterThan(controller.lastServerQueueDelayMs, 1_000)
     }
 
-    func testServerQueueDelayUsesMeasuredDrainRate() {
+    func testServerQueueDelayIsBoundedByPacingRate() {
         let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
-        controller.seedFromAutoDetect(bandwidthKbps: 100_000, rttMs: 10)
+        seed(controller, bandwidthKbps: 100_000, rttMs: 10)
 
         controller.noteServerQueue(bytes: 500_000)
 
-        XCTAssertEqual(controller.serverQueueDrainBitrate, 100_000_000)
-        XCTAssertEqual(controller.lastServerQueueDelayMs, 40, accuracy: 0.1)
+        XCTAssertEqual(controller.serverQueueDrainBitrate, 20_000_000)
+        XCTAssertEqual(controller.lastServerQueueDelayMs, 200, accuracy: 0.1)
         XCTAssertEqual(controller.targetFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
     }
@@ -137,7 +139,7 @@ final class VideoTargetControllerTests: XCTestCase {
     func testExpiredAutoDetectRateDoesNotLimitNetworkAdaptation() {
         let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
         let start = Date()
-        controller.seedFromAutoDetect(bandwidthKbps: 5_000, rttMs: 10, now: start)
+        seed(controller, bandwidthKbps: 5_000, rttMs: 10, now: start)
 
         controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(31))
 
@@ -169,7 +171,7 @@ final class VideoTargetControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.targetFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
-        XCTAssertEqual(controller.perfSnapshot.quality.networkPressure, 0, accuracy: 0.01)
+        XCTAssertEqual(controller.performanceSnapshot().quality.networkPressure, 0, accuracy: 0.01)
         XCTAssertGreaterThan(controller.linkQualityScore, 0.9)
     }
 
@@ -280,21 +282,13 @@ final class VideoTargetControllerTests: XCTestCase {
         XCTAssertEqual(controller.targetFPS, 60)
     }
 
-    func testQualityFirstReachesMinimumFPSBeforeReducingBitrate() {
+    func testQualityFirstReducesBitrateAndFPSOnFirstCongestionStep() {
         let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
         let start = Date()
+        controller.noteServerQueue(bytes: 500_000, now: start)
+        controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(0.6))
 
-        for index in 0..<14 {
-            controller.noteServerQueue(
-                bytes: 500_000,
-                now: start.addingTimeInterval(Double(index) * 0.6)
-            )
-        }
-
-        XCTAssertEqual(controller.targetFPS, VideoTargetController.minAdaptiveFPS)
-        XCTAssertEqual(controller.targetBitrate, 20_000_000)
-
-        controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(8.4))
+        XCTAssertEqual(controller.targetFPS, 48)
         XCTAssertEqual(controller.targetBitrate, 17_000_000)
     }
 
@@ -320,7 +314,7 @@ final class VideoTargetControllerTests: XCTestCase {
 
         XCTAssertEqual(controller.targetFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
-        XCTAssertLessThan(controller.perfSnapshot.networkPressure, 1)
+        XCTAssertLessThan(controller.performanceSnapshot().networkPressure, 1)
     }
 
     func testNetworkRecoveryRequiresDwellAndIsGradual() {
@@ -336,6 +330,9 @@ final class VideoTargetControllerTests: XCTestCase {
         XCTAssertEqual(controller.targetFPS, reducedFPS)
         controller.noteServerQueue(bytes: 0, now: start.addingTimeInterval(3.0))
 
+        XCTAssertEqual(controller.targetFPS, reducedFPS)
+        XCTAssertEqual(controller.targetBitrate, 20_000_000)
+        controller.noteServerQueue(bytes: 0, now: start.addingTimeInterval(4.2))
         XCTAssertGreaterThan(controller.targetFPS, reducedFPS)
         XCTAssertLessThan(controller.targetFPS, 60)
     }
@@ -371,27 +368,15 @@ final class VideoTargetControllerTests: XCTestCase {
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
     }
 
-    func testClientRenderPressureUsesTimeDwell() {
+    func testQoEIsDiagnosticAndDoesNotAdaptTargets() {
         let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
         let start = Date()
+        controller.noteClientQoE(renderMs: 113, now: start)
+        controller.noteClientQoE(renderMs: 113, now: start.addingTimeInterval(0.6))
 
-        controller.noteClientRenderTiming(commandDecodeMs: 32, renderMs: 81, now: start)
         XCTAssertEqual(controller.targetFPS, 60)
-        controller.noteClientRenderTiming(
-            commandDecodeMs: 32,
-            renderMs: 81,
-            now: start.addingTimeInterval(0.1)
-        )
-        XCTAssertEqual(controller.targetFPS, 60)
-        controller.noteClientRenderTiming(
-            commandDecodeMs: 32,
-            renderMs: 81,
-            now: start.addingTimeInterval(0.6)
-        )
-
-        XCTAssertLessThan(controller.targetFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
-        XCTAssertEqual(controller.perfSnapshot.pressureSource, .decoder)
+        XCTAssertEqual(controller.performanceSnapshot().clientPressure, 0)
     }
 
     func testStallRecoveryStillRequiresRepeatedTimeouts() {
@@ -432,11 +417,26 @@ final class VideoTargetControllerTests: XCTestCase {
                 acknowledgedBytes: 10_000,
                 acknowledgementIntervalMs: 16
             )
-            _ = controller.perfSnapshot
+            _ = controller.performanceSnapshot()
         }
 
         XCTAssertGreaterThanOrEqual(controller.targetFPS, VideoTargetController.minAdaptiveFPS)
         XCTAssertGreaterThanOrEqual(controller.targetBitrate, VideoTargetController.minAdaptiveBitrate)
+    }
+
+    private func seed(
+        _ controller: VideoTargetController,
+        bandwidthKbps: UInt32,
+        rttMs: UInt32,
+        now: Date = Date()
+    ) {
+        var metrics = NetworkAutoDetect.Metrics()
+        metrics.baseRTTMs = rttMs
+        metrics.averageRTTMs = rttMs
+        metrics.bandwidthKbps = bandwidthKbps
+        metrics.rttMeasuredAtNanoseconds = 1
+        metrics.bandwidthMeasuredAtNanoseconds = 1
+        controller.updateAutoDetect(metrics, now: now)
     }
 
     private func acknowledge(

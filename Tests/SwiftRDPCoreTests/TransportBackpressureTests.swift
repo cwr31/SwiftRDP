@@ -33,15 +33,20 @@ final class TransportBackpressureTests: XCTestCase {
         XCTAssertTrue(session.graphicsWritable)
     }
 
-    func testVideoQueueBudgetUsesMeasuredDrainRate() {
+    func testVideoQueueBudgetTracksPacingRate() {
         let session = RDPSession(config: ServerConfig())
-        session.videoController.seedFromAutoDetect(bandwidthKbps: 100_000, rttMs: 10)
+        var metrics = NetworkAutoDetect.Metrics()
+        metrics.bandwidthKbps = 100_000
+        metrics.baseRTTMs = 10
+        metrics.rttMeasuredAtNanoseconds = 1
+        metrics.bandwidthMeasuredAtNanoseconds = 1
+        session.videoController.updateAutoDetect(metrics)
         let initial = session.videoOutboundQueueWatermarks()
 
         session.applyVideoBitrate(1_000_000)
         let reduced = session.videoOutboundQueueWatermarks()
 
-        XCTAssertEqual(reduced.limit, initial.limit)
+        XCTAssertLessThan(reduced.limit, initial.limit)
         XCTAssertGreaterThanOrEqual(reduced.limit, reduced.high)
         XCTAssertGreaterThan(reduced.high, reduced.low)
     }

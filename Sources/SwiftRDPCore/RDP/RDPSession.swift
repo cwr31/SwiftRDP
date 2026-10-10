@@ -210,6 +210,7 @@ public final class RDPSession: @unchecked Sendable {
     private let transportStateLock = NSLock()
     private var channelWritableValue = true
     private var videoOutboundQueueBlockedValue = false
+    private var videoFrameQueueFullValue = false
     private var unwritableSinceValue: Date?
 
     /// Queue admission is expressed as time at the estimated socket drain rate.
@@ -219,8 +220,8 @@ public final class RDPSession: @unchecked Sendable {
         func bytes(for milliseconds: Double) -> Int {
             max(1, Int((bitrate * milliseconds / 8_000).rounded(.up)))
         }
-        let high = max(32 * 1024, bytes(for: VideoTargetController.serverQueueBudgetMs))
-        let low = max(8 * 1024, bytes(for: VideoTargetController.serverQueueResumeMs))
+        let high = max(4 * 1024, bytes(for: VideoTargetController.serverQueueBudgetMs))
+        let low = max(2 * 1024, bytes(for: VideoTargetController.serverQueueResumeMs))
         let limit = max(high, bytes(for: VideoTargetController.serverQueueLimitMs))
         return (high, min(low, high), limit)
     }
@@ -240,7 +241,13 @@ public final class RDPSession: @unchecked Sendable {
     var graphicsWritable: Bool {
         transportStateLock.lock()
         defer { transportStateLock.unlock() }
-        return channelWritableValue && !videoOutboundQueueBlockedValue
+        return channelWritableValue && !videoOutboundQueueBlockedValue && !videoFrameQueueFullValue
+    }
+
+    func setVideoFrameQueueFull(_ full: Bool) {
+        transportStateLock.lock()
+        videoFrameQueueFullValue = full
+        transportStateLock.unlock()
     }
     var hostCursorHidden = false
 
@@ -418,18 +425,18 @@ public final class RDPSession: @unchecked Sendable {
         }
         appliedCaptureFPS = fps
         captureTargetLock.unlock()
-        sharedCapture?.updateCaptureFPS(fps: fps)
+        sharedCapture?.updateCaptureFPS(owner: id, fps: fps)
     }
 
     func updateSharedCaptureAudio() {
-        sharedCapture?.updateAudio(enabled: sendsAudioToController)
+        sharedCapture?.updateAudio(owner: id, enabled: sendsAudioToController)
     }
 
     deinit {
         captureTask?.cancel()
         captureRestartTask?.cancel()
         idleWatchTask?.cancel()
-        sharedCapture?.detach()
+        sharedCapture?.detach(owner: id)
         if sessionManager == nil {
             virtualDisplay.destroy()
         }
@@ -803,8 +810,8 @@ public final class RDPSession: @unchecked Sendable {
         vcRouter.sendToChannel = { [weak self] channelId, payload in
             _ = self?.writeVC(channelId: channelId, payload: payload)
         }
-        vcRouter.sendToChannelBatch = { [weak self] channelId, payloads, priority in
-            self?.writeVCBatch(channelId: channelId, payloads: payloads, priority: priority)
+        vcRouter.sendToChannelBatch = { [weak self] channelId, payloads, priority, onWritten in
+            self?.writeVCBatch(channelId: channelId, payloads: payloads, priority: priority, onWritten: onWritten)
         }
 
         // GFX gate: drdynvc ∧ dynvc-gfx capability ∧ Display Mode H.264/RemoteFX
@@ -952,21 +959,22 @@ public final class RDPSession: @unchecked Sendable {
     private func writeVCBatch(
         channelId: UInt16,
         payloads: [[UInt8]],
-        priority: RDPSocket.WritePriority
+        priority: RDPSocket.WritePriority,
+        onWritten: RDPSocket.WriteCompletion?
     ) -> Int? {
         guard !payloads.isEmpty else { return 0 }
-        var combined: [UInt8] = []
-        combined.reserveCapacity(payloads.reduce(0) { $0 + $1.count + 64 })
+        var packets: [[UInt8]] = []
+        packets.reserveCapacity(payloads.count)
         for payload in payloads {
             let mcs = MCS.buildSendDataIndication(
                 userId: mcsUserId,
                 channelId: channelId,
                 data: payload
             )
-            combined.append(contentsOf: X224.buildData(mcs))
+            packets.append(X224.buildData(mcs))
         }
-        guard write(combined, priority: priority) else { return nil }
-        return combined.count
+        guard socket.writeBatch(packets, priority: priority, onWritten: onWritten) else { return nil }
+        return packets.reduce(0) { $0 + $1.count }
     }
 
     private func handleIOChannel(_ payload: [UInt8]) {
@@ -1181,13 +1189,7 @@ public final class RDPSession: @unchecked Sendable {
                 ? metrics.averageRTTMs
                 : metrics.baseRTTMs
             self.info.autoDetectBandwidthKbps = metrics.bandwidthKbps
-            // Classify LAN from baseRTT (connect-time / min). Average RTT often
-            // includes GFX encode+ACK delay and falsely flips sessions to WAN.
-            let base = metrics.baseRTTMs > 0 ? metrics.baseRTTMs : metrics.averageRTTMs
-            self.videoController.seedFromAutoDetect(
-                bandwidthKbps: metrics.bandwidthKbps,
-                rttMs: base
-            )
+            self.videoController.updateAutoDetect(metrics)
             self.gfx.applyLiveControllerCaps()
             self.gfx.targetFPS = max(self.videoController.targetFPS, 1)
         }
@@ -1198,10 +1200,6 @@ public final class RDPSession: @unchecked Sendable {
               clientSupportsNetCharAutoDetect || clientInfoAutoDetect
         else { return }
         wireNetworkAutoDetectCallbacks()
-        networkAutoDetect.shouldDeferContinuousBandwidth = { [weak self] in
-            guard let self else { return false }
-            return self.gfx.desktopRecentlyHot || !self.graphicsWritable
-        }
         networkAutoDetect.startContinuous()
     }
 
@@ -1641,7 +1639,7 @@ public final class RDPSession: @unchecked Sendable {
         idleWatchTask?.cancel()
         capsTimeoutTask?.cancel()
         capsTimeoutTask = nil
-        sharedCapture?.detach()
+        sharedCapture?.detach(owner: id)
         // Shared VD and shared capture live on SessionManager and are released
         // after the last active session leaves.
         cursor.stop()

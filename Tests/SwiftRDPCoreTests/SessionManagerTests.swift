@@ -62,6 +62,22 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertFalse(manager.hasActiveSession)
     }
 
+    func testAuthenticatedSessionLifecycleCallbacks() {
+        let manager = SessionManager(config: ServerConfig())
+        let session = RDPSession(config: ServerConfig())
+        var started: [UUID] = []
+        var ended: [UUID] = []
+        manager.onAuthenticatedSessionStarted = { started.append($0) }
+        manager.onAuthenticatedSessionEnded = { ended.append($0) }
+
+        manager.registerSession(session)
+        XCTAssertTrue(manager.promoteSession(session))
+        XCTAssertEqual(started, [session.id])
+
+        manager.unregisterSession(session)
+        XCTAssertEqual(ended, [session.id])
+    }
+
     func testPromoteRestoresVirtualCaptureResolutionWithoutChangingRDPSize() {
         let config = ServerConfig(hostDisplayPolicy: .virtual)
         let manager = SessionManager(config: config)

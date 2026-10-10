@@ -177,7 +177,6 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
     public func setCaptureFPS(_ fps: Int) {
         let clamped = max(1, min(fps, 60))
         let stream = locked { () -> SCStream? in
-            guard clamped != captureFPS else { return nil }
             captureFPS = clamped
             guard wantsCapture else { return nil }
             return activeStream
@@ -187,16 +186,19 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         scheduleLiveConfigurationUpdate(stream: stream, reason: "fps")
     }
 
-    /// Keep only the newest live retune in flight. ScreenCaptureKit applies
-    /// configuration asynchronously, so overlapping updates can otherwise make
-    /// an old controller target arrive after a newer one.
+    /// Serialize native updates and read the current target after the previous
+    /// update completes. Cancellation must not reorder ScreenCaptureKit commits.
     private func scheduleLiveConfigurationUpdate(stream: SCStream, reason: String) {
-        let configuration = liveConfiguration()
         lock.lock()
+        let previous = configurationUpdateTask
         configurationUpdateGeneration &+= 1
         let generation = configurationUpdateGeneration
         configurationUpdateTask?.cancel()
         let task = Task { [weak self, stream] in
+            await previous?.value
+            guard !Task.isCancelled, let self,
+                  self.locked({ self.activeStream === stream && self.wantsCapture }) else { return }
+            let configuration = self.liveConfiguration()
             do {
                 try await stream.updateConfiguration(configuration)
             } catch is CancellationError {
@@ -206,7 +208,6 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
                     "ScreenCapturer: \(reason) update failed: \(error)"
                 )
             }
-            guard let self else { return }
             self.locked {
                 if self.configurationUpdateGeneration == generation {
                     self.configurationUpdateTask = nil

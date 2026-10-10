@@ -7,7 +7,8 @@ public protocol GraphicsTransport: AnyObject, Sendable {
     func sendGraphicsPDUs(
         _ pdus: [[UInt8]],
         compress: Bool,
-        priority: RDPSocket.WritePriority
+        priority: RDPSocket.WritePriority,
+        onWritten: RDPSocket.WriteCompletion?
     ) -> Int?
     func reset()
 }
@@ -15,11 +16,11 @@ public protocol GraphicsTransport: AnyObject, Sendable {
 /// RDP dynamic Graphics channel transport using one ZGFX segment per PDU.
 public final class RDPGFXDynamicChannelTransport: GraphicsTransport, @unchecked Sendable {
     private let lock = NSLock()
-    private let sendFrame: ([[UInt8]], RDPSocket.WritePriority) -> Int?
+    private let sendFrame: ([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?
     private let zgfx = ZGFXCompressor()
 
     public init(
-        sendFrame: @escaping ([[UInt8]], RDPSocket.WritePriority) -> Int?
+        sendFrame: @escaping ([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?
     ) {
         self.sendFrame = sendFrame
     }
@@ -28,7 +29,8 @@ public final class RDPGFXDynamicChannelTransport: GraphicsTransport, @unchecked 
     public func sendGraphicsPDUs(
         _ pdus: [[UInt8]],
         compress: Bool = true,
-        priority: RDPSocket.WritePriority = .control
+        priority: RDPSocket.WritePriority = .control,
+        onWritten: RDPSocket.WriteCompletion? = nil
     ) -> Int? {
         guard !pdus.isEmpty else { return 0 }
         lock.lock()
@@ -48,7 +50,9 @@ public final class RDPGFXDynamicChannelTransport: GraphicsTransport, @unchecked 
             wrapped.append(zgfx.wrap(pdu, compress: compress))
         }
         guard !wrapped.isEmpty else { return 0 }
-        return sendFrame(wrapped, priority)
+        // Graphics control and video share one DVC reassembly stream. Preserve
+        // their order while audio and other static channels can interleave.
+        return sendFrame(wrapped, priority == .control ? .graphicsControl : priority, onWritten)
     }
 
     public func reset() {

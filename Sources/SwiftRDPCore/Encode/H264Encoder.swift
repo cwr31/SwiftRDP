@@ -56,11 +56,12 @@ public final class H264Encoder {
     private var sweepScheduled = false
     private var generation: UInt64 = 0
     private var idrCount = 0
-    private var ptsValue: Int64 = 0
+    private var presentationOriginNanoseconds: UInt64?
+    private var lastPresentationNanoseconds: Int64 = -1
     private var loggedRateControlSupport = false
     private var rateControl = RateControlSupport()
 
-    private static let ptsTimescale: CMTimeScale = 600
+    private static let ptsTimescale: CMTimeScale = 1_000_000_000
     private static let frameTimeout: TimeInterval = 1.0
     private static let sweepInterval: TimeInterval = 0.25
     public var bitrate: Int = 12_500_000
@@ -91,7 +92,8 @@ public final class H264Encoder {
             height: self.height
         )
         pendingForceKeyframe = true
-        ptsValue = 0
+        presentationOriginNanoseconds = nil
+        lastPresentationNanoseconds = -1
         loggedRateControlSupport = false
         session = try makeSession(width: self.width, height: self.height)
         RDPLog.gfx.info("H264: AVC420 VideoToolbox zero-copy (NV12/BGRA -> VT)")
@@ -211,11 +213,13 @@ public final class H264Encoder {
             return nil
         }
         let force = consumeForceKeyframeLocked()
-        let durationValue = CMTimeValue(
-            max(1, Int(Self.ptsTimescale) / max(encoderPictureRate, 1))
-        )
-        let pts = CMTime(value: ptsValue, timescale: Self.ptsTimescale)
-        ptsValue += durationValue
+        let now = DispatchTime.now().uptimeNanoseconds
+        let origin = presentationOriginNanoseconds ?? now
+        presentationOriginNanoseconds = origin
+        let elapsed = Int64(now - origin)
+        let value = max(elapsed, lastPresentationNanoseconds + 1)
+        lastPresentationNanoseconds = value
+        let pts = CMTime(value: value, timescale: Self.ptsTimescale)
         let key = pts.value
         let submissionGeneration = generation
         pending[key] = PendingFrame(
@@ -226,7 +230,6 @@ public final class H264Encoder {
         scheduleSweepLocked()
         lock.unlock()
 
-        let duration = CMTime(value: durationValue, timescale: Self.ptsTimescale)
         let properties: CFDictionary? = force
             ? ([kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary)
             : nil
@@ -235,7 +238,7 @@ public final class H264Encoder {
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: pts,
-            duration: duration,
+            duration: .invalid,
             frameProperties: properties,
             infoFlagsOut: &encodeInfoFlags
         ) { [weak self] status, infoFlags, sampleBuffer in

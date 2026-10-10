@@ -35,8 +35,7 @@ final class VideoTraceReplayTests: XCTestCase {
             }
 
             if let render = number(values["render"]), render > 0 {
-                controller.noteClientRenderTiming(
-                    commandDecodeMs: 0,
+                controller.noteClientQoE(
                     renderMs: Int(render),
                     now: timestamp
                 )
@@ -49,7 +48,7 @@ final class VideoTraceReplayTests: XCTestCase {
                 acknowledgementIntervalMs: 100,
                 now: timestamp
             )
-            let quality = controller.perfSnapshot.quality
+            let quality = controller.performanceSnapshot(now: timestamp).quality
             maximumNetworkPressure = max(maximumNetworkPressure, quality.networkPressure)
             maximumClientPressure = max(maximumClientPressure, quality.clientPressure)
         }

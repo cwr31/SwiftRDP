@@ -2,6 +2,49 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class AutoDetectPDUTests: XCTestCase {
+    func testEachMeasurementNotifiesOnceAndCarriesIndependentSampleIdentity() {
+        let detector = NetworkAutoDetect()
+        defer { detector.stop() }
+        var sent: [[UInt8]] = []
+        var updates: [NetworkAutoDetect.Metrics] = []
+        detector.onSend = { sent.append($0) }
+        detector.onMetricsUpdated = { updates.append($0) }
+        detector.beginConnectTime()
+        let rttSequence = UInt16(sent[0][6]) | UInt16(sent[0][7]) << 8
+        detector.handleClientResponse(.rtt(sequenceNumber: rttSequence))
+        XCTAssertEqual(updates.count, 1)
+        XCTAssertGreaterThan(updates[0].rttMeasuredAtNanoseconds, 0)
+        XCTAssertEqual(updates[0].bandwidthMeasuredAtNanoseconds, 0)
+        let bwSequence = UInt16(sent[1][6]) | UInt16(sent[1][7]) << 8
+        detector.handleClientResponse(.bandwidthResults(
+            sequenceNumber: bwSequence, responseType: AutoDetectPDU.bwResultsConnectTime,
+            timeDeltaMs: 500, byteCount: 100_000
+        ))
+        XCTAssertEqual(updates.count, 2)
+        XCTAssertEqual(updates[1].rttMeasuredAtNanoseconds, updates[0].rttMeasuredAtNanoseconds)
+        XCTAssertGreaterThan(updates[1].bandwidthMeasuredAtNanoseconds, 0)
+    }
+
+    func testBandwidthStageGetsItsOwnDeadline() async throws {
+        let detector = NetworkAutoDetect()
+        defer { detector.stop() }
+        var sent: [[UInt8]] = []
+        detector.onSend = { sent.append($0) }
+        detector.beginConnectTime()
+        let rttSequence = UInt16(sent[0][6]) | UInt16(sent[0][7]) << 8
+        try await Task.sleep(nanoseconds: 2_200_000_000)
+        detector.handleClientResponse(.rtt(sequenceNumber: rttSequence))
+        let bwSequence = UInt16(sent[1][6]) | UInt16(sent[1][7]) << 8
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        XCTAssertEqual(detector.phase, .connectBandwidth)
+        detector.handleClientResponse(.bandwidthResults(
+            sequenceNumber: bwSequence, responseType: AutoDetectPDU.bwResultsConnectTime,
+            timeDeltaMs: 3_000, byteCount: 196_608
+        ))
+        XCTAssertEqual(detector.phase, .complete)
+        XCTAssertTrue(detector.metrics.hasBandwidth)
+    }
+
     func testBandwidthKbpsFormula() {
         // 1_000_000 bytes in 800ms → 10_000 kbps
         XCTAssertEqual(AutoDetectPDU.bandwidthKbps(timeDeltaMs: 800, byteCount: 1_000_000), 10_000)

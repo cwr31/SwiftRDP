@@ -247,6 +247,10 @@ struct GeneralSettingsView: View {
 struct SessionSettingsView: View {
     @ObservedObject var prefs: AppPreferences
     @State private var timeoutText: String
+    @State private var hostLoginPassword = ""
+    @State private var hasHostLoginPassword = false
+    @State private var accessibilityOK = false
+    @State private var hostLoginPasswordStatus: String?
 
     init(prefs: AppPreferences) {
         self.prefs = prefs
@@ -282,9 +286,56 @@ struct SessionSettingsView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Section(L10n.t(.remoteSessionSecurity)) {
+                Toggle(
+                    L10n.t(.keepScreenUnlockedWhileConnected),
+                    isOn: $prefs.keepScreenUnlockedWhileConnected
+                )
+                .disabled(!hasHostLoginPassword || !prefs.authEnabled || !accessibilityOK)
+
+                Text(L10n.t(.keepUnlockedHelp))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                SecureField(L10n.t(.hostLoginPassword), text: $hostLoginPassword)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Button(L10n.t(.saveHostLoginPassword), systemImage: "key.fill") {
+                        saveHostLoginPassword()
+                    }
+                    .disabled(hostLoginPassword.isEmpty)
+
+                    if hasHostLoginPassword {
+                        Button(L10n.t(.removeHostLoginPassword), systemImage: "trash") {
+                            removeHostLoginPassword()
+                        }
+                    }
+                }
+
+                Text(L10n.t(.hostLoginPasswordHelp))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let hostLoginPasswordStatus {
+                    Text(hostLoginPasswordStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .formStyle(.grouped)
-        .onAppear { timeoutText = String(prefs.idleTimeout) }
+        .onAppear {
+            timeoutText = String(prefs.idleTimeout)
+            hasHostLoginPassword = HostUnlockCredentialStore.hasCredential
+            accessibilityOK = PermissionGate.isAccessibilityTrusted
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            accessibilityOK = PermissionGate.isAccessibilityTrusted
+        }
         .onChange(of: prefs.idleTimeout) { _, value in
             if timeoutText != String(value) {
                 timeoutText = String(value)
@@ -300,6 +351,27 @@ struct SessionSettingsView: View {
     private func updateTimeout() {
         guard isTimeoutValid, let value = Int(timeoutText), value != prefs.idleTimeout else { return }
         prefs.idleTimeout = value
+    }
+
+    private func saveHostLoginPassword() {
+        guard HostUnlockCredentialStore.save(hostLoginPassword) else {
+            hostLoginPasswordStatus = L10n.t(.hostLoginPasswordSaveFailed)
+            return
+        }
+        hostLoginPassword = ""
+        hasHostLoginPassword = true
+        hostLoginPasswordStatus = L10n.t(.hostLoginPasswordSaved)
+    }
+
+    private func removeHostLoginPassword() {
+        prefs.keepScreenUnlockedWhileConnected = false
+        guard HostUnlockCredentialStore.remove() else {
+            hostLoginPasswordStatus = L10n.t(.hostLoginPasswordSaveFailed)
+            return
+        }
+        hostLoginPassword = ""
+        hasHostLoginPassword = false
+        hostLoginPasswordStatus = nil
     }
 }
 

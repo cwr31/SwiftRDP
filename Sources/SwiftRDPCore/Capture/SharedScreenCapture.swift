@@ -21,6 +21,7 @@ public final class SharedScreenCapture: @unchecked Sendable {
     }
 
     private struct Observer {
+        let owner: UUID
         let onFrameAvailable: () -> Void
         let onAudio: (([Int16], Int, Int) -> Void)?
         let onDisplayChanged: (() -> Void)?
@@ -105,6 +106,7 @@ public final class SharedScreenCapture: @unchecked Sendable {
     }
 
     public func attach(
+        owner: UUID,
         captureFPS: Int,
         capturesAudio: Bool,
         onFrameAvailable: @escaping () -> Void,
@@ -112,9 +114,9 @@ public final class SharedScreenCapture: @unchecked Sendable {
         onDisplayChanged: (() -> Void)? = nil,
         onFatalError: ((Error) -> Void)? = nil
     ) {
-        let configuration: (fps: Int?, audio: Bool?)
         lock.lock()
         observer = Observer(
+            owner: owner,
             onFrameAvailable: onFrameAvailable,
             onAudio: onAudio,
             onDisplayChanged: onDisplayChanged,
@@ -122,44 +124,41 @@ public final class SharedScreenCapture: @unchecked Sendable {
         )
         requestedFPS = Self.clampFPS(captureFPS)
         requestedAudio = capturesAudio
-        configuration = updateConfigurationLocked()
+        applyConfigurationLocked()
         lock.unlock()
-        apply(configuration)
     }
 
-    public func updateCaptureFPS(fps: Int) {
-        let configuration: (fps: Int?, audio: Bool?)
+    public func updateCaptureFPS(owner: UUID, fps: Int) {
         lock.lock()
-        guard observer != nil else {
+        guard observer?.owner == owner else {
             lock.unlock()
             return
         }
         requestedFPS = Self.clampFPS(fps)
-        configuration = updateConfigurationLocked()
+        applyConfigurationLocked()
         lock.unlock()
-        apply(configuration)
     }
 
-    public func updateAudio(enabled: Bool) {
-        let configuration: (fps: Int?, audio: Bool?)
+    public func updateAudio(owner: UUID, enabled: Bool) {
         lock.lock()
-        guard observer != nil else {
+        guard observer?.owner == owner else {
             lock.unlock()
             return
         }
         requestedAudio = enabled
-        configuration = updateConfigurationLocked()
+        applyConfigurationLocked()
         lock.unlock()
-        apply(configuration)
     }
 
-    public func detach() {
-        let configuration: (fps: Int?, audio: Bool?)
+    public func detach(owner: UUID) {
         lock.lock()
+        guard observer?.owner == owner else {
+            lock.unlock()
+            return
+        }
         observer = nil
-        configuration = updateConfigurationLocked()
+        applyConfigurationLocked()
         lock.unlock()
-        apply(configuration)
     }
 
     public func start(target: Target) async throws {
@@ -279,39 +278,32 @@ public final class SharedScreenCapture: @unchecked Sendable {
         return body()
     }
 
-    private func updateConfigurationLocked() -> (fps: Int?, audio: Bool?) {
+    /// Apply while holding the owner lock so a displaced owner's retune cannot
+    /// arrive after the replacement session's configuration.
+    private func applyConfigurationLocked() {
         guard observer != nil else {
-            let audioChange = configuredAudio ? false : nil
             configuredFPS = 0
-            configuredAudio = false
-            return (nil, audioChange)
+            if configuredAudio {
+                configuredAudio = false
+                capturer.capturesAudio = false
+            }
+            return
         }
-        let fps = max(requestedFPS, 1)
-        let audio = requestedAudio
-        let fpsChange = fps == configuredFPS ? nil : fps
-        let audioChange = audio == configuredAudio ? nil : audio
-        configuredFPS = fps
-        configuredAudio = audio
-        return (fpsChange, audioChange)
+        if configuredFPS != requestedFPS {
+            configuredFPS = requestedFPS
+            capturer.setCaptureFPS(requestedFPS)
+        }
+        if configuredAudio != requestedAudio {
+            configuredAudio = requestedAudio
+            capturer.capturesAudio = requestedAudio
+        }
     }
 
     private func applyCurrentConfiguration() {
-        let configuration = locked {
-            (
-                fps: max(requestedFPS, 1),
-                audio: requestedAudio
-            )
-        }
-        capturer.setCaptureFPS(configuration.fps)
-        capturer.capturesAudio = configuration.audio
-    }
-
-    private func apply(_ configuration: (fps: Int?, audio: Bool?)) {
-        if let fps = configuration.fps {
-            capturer.setCaptureFPS(fps)
-        }
-        if let audio = configuration.audio {
-            capturer.capturesAudio = audio
+        locked {
+            guard observer != nil else { return }
+            capturer.setCaptureFPS(requestedFPS)
+            capturer.capturesAudio = requestedAudio
         }
     }
 

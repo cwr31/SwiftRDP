@@ -16,6 +16,7 @@ public enum ClientQueueFeedback: Sendable, Equatable {
 }
 
 public enum VideoLinkState: String, Sendable, Equatable {
+    case unknown
     case healthy
     case probing
     case congested
@@ -26,7 +27,6 @@ public enum VideoPressureSource: String, Sendable, Equatable {
     case network
     case serverQueue
     case clientQueue
-    case decoder
     case encoder
 }
 
@@ -48,8 +48,8 @@ public struct VideoQualityStatus: Sendable, Equatable {
     public let targetBitrate: Int
 
     public static let empty = VideoQualityStatus(
-        state: .healthy,
-        linkState: .healthy,
+        state: .unknown,
+        linkState: .unknown,
         pressureSource: .none,
         score: 0.5,
         networkPressure: 0,
@@ -91,6 +91,12 @@ public final class VideoTargetController: @unchecked Sendable {
     private var lastServerQueueDelayMsValue = 0.0
     private var lastClientRenderMsValue = 0.0
     private var lastClientRenderAtValue: Date?
+    private var lastFrameAckAt: Date?
+    private var lastEncodeAt: Date?
+    private var detectedRTTMs: Double?
+    private var lastRTTSampleNanoseconds: UInt64 = 0
+    private var lastBandwidthSampleNanoseconds: UInt64 = 0
+    private var detectedRTTAt: Date?
     private var lastReportedBitrateValue = 0
     private var linkQualityScoreValue = 0.5
     private var networkPressureValue = 0.0
@@ -100,9 +106,7 @@ public final class VideoTargetController: @unchecked Sendable {
 
     private var linkState: VideoLinkState = .healthy
     private var baseAckLatencyMs: Double?
-    private var currentExcessAckDelayMs = 0.0
     private var excessAckDelayEmaMs = 0.0
-    private var networkExcessAckDelayEmaMs = 0.0
     private var acknowledgedBitrateEmaBps = 0.0
     private var networkCapacityEmaBps = 0.0
     private var acknowledgedFrameBytesEma = 0.0
@@ -115,9 +119,6 @@ public final class VideoTargetController: @unchecked Sendable {
     private var outputWindowBytes = 0
     private var encodeLatenciesMs: [Double] = []
     private var ackLatenciesMs: [Double] = []
-    private var encodeLimited = false
-    private var encodePressureStreak = 0
-    private var decoderLimited = false
     private var acknowledgedBitrateSampleCount = 0
 
     private var networkPressureSinceValue: Date?
@@ -162,11 +163,11 @@ public final class VideoTargetController: @unchecked Sendable {
     public static let networkDelayBudgetFloorMs = 25.0
     private static let encodePressureSampleWindow = 16
     public static let encodePressureBudgetRatio = 0.85
-    public static let encodeSustainableFPSRatio = 0.90
     public static let networkBitrateDecreaseFactor = 0.85
     public static let networkBitrateRecoveryFactor = 1.25
     private static let minimumAcknowledgedBytes = 4 * 1024
     private static let minimumAcknowledgedBitrateSamples = 3
+    private static let feedbackLifetime: TimeInterval = 5
 
     public init(
         bitrate: Int = ServerConfig.defaultVideoBitrate,
@@ -197,8 +198,7 @@ public final class VideoTargetController: @unchecked Sendable {
     public var lastClientQueueDelayMs: Double? { locked { lastClientQueueDelayMsValue } }
     public var lastServerQueueBytes: Int { locked { lastServerQueueBytesValue } }
     public var lastServerQueueDelayMs: Double { locked { lastServerQueueDelayMsValue } }
-    /// Independent estimate of the egress rate used to turn server queue bytes
-    /// into time. The target bitrate is a quality goal, not a socket drain rate.
+    /// Queue drain is bounded by both the measured path and video pacing rate.
     public var serverQueueDrainBitrate: Int {
         locked {
             max(
@@ -213,21 +213,17 @@ public final class VideoTargetController: @unchecked Sendable {
     public var adaptationPriority: VideoAdaptationPriority { locked { adaptationPriorityValue } }
     public var rfxAdaptiveMode: Bool { locked { rfxAdaptiveModeValue } }
 
-    public var isHealthyLink: Bool {
-        locked { linkState == .healthy && !stallRecoveryModeValue }
-    }
-
     /// Returns the number of frames needed to keep the measured path's BDP in
     /// flight, bounded by the client's advertised ceiling.
     public func recommendedFrameAcknowledgementWindow(clientCeiling: Int) -> Int {
         locked {
-            let ceiling = max(clientCeiling, 1)
+            let ceiling = min(max(clientCeiling, 1), 12)
             let fps = Double(max(targetFPSValue, 1))
             let targetFrameBytes = Double(max(targetBitrateValue, Self.minAdaptiveBitrate))
                 / fps / 8
             let frameBytes = max(targetFrameBytes * 0.75, acknowledgedFrameBytesEma)
             let rttMs = max(
-                baseAckLatencyMs ?? (1_000 / fps),
+                max(detectedRTTMs ?? 0, baseAckLatencyMs ?? 0),
                 1_000 / fps
             )
             let now = Date()
@@ -238,7 +234,7 @@ public final class VideoTargetController: @unchecked Sendable {
             let capacity = capacityIsFresh
                 ? networkCapacityEmaBps
                 : Double(max(targetBitrateValue, Self.minAdaptiveBitrate))
-            let bdpBytes = capacity * rttMs / 8_000
+            let bdpBytes = min(capacity, Double(targetBitrateValue)) * rttMs / 8_000
             var window = max(1, Int(ceil(bdpBytes / max(frameBytes, 1))))
             if case .queued(let queueBytes) = lastClientQueueFeedbackValue, queueBytes > 0 {
                 let queueFactor = bdpBytes / (bdpBytes + Double(queueBytes))
@@ -249,7 +245,7 @@ public final class VideoTargetController: @unchecked Sendable {
             case .queued(let bytes): queuePressure = bytes > 0
             case .unavailable, .suspended: queuePressure = false
             }
-            let severeAckPressure = networkExcessAckDelayEmaMs > rttMs * 1.5
+            let severeAckPressure = excessAckDelayEmaMs > rttMs * 1.5
             let safeFloor = !stallRecoveryModeValue && !queuePressure && !severeAckPressure
                 ? min(2, ceiling)
                 : 1
@@ -294,8 +290,7 @@ public final class VideoTargetController: @unchecked Sendable {
                 }
                 if encoderFPSCap >= previous {
                     encoderFPSCap = previous
-                    encodeLimited = true
-                }
+                        }
                 if decoderFPSCap >= previous {
                     decoderFPSCap = configuredFPSValue
                 }
@@ -336,6 +331,7 @@ public final class VideoTargetController: @unchecked Sendable {
             updateOutputBitrateLocked(bytes: bytes, now: now)
             if let serverUnacked { lastServerUnacked = max(serverUnacked, 0) }
             if let ackWindow { lastAckWindow = max(ackWindow, 0) }
+            lastEncodeAt = now
             if encodeMs > 0, !isIDR {
                 encodeLatenciesMs.append(encodeMs)
                 if encodeLatenciesMs.count > Self.encodePressureSampleWindow {
@@ -349,11 +345,11 @@ public final class VideoTargetController: @unchecked Sendable {
             prepMsSinceSummary += max(prepMs, 0)
             captureAgeMsSinceSummary += max(captureAgeMs, 0)
             if isIDR { idrSinceSummary += 1 }
+            refreshFeedbackPressureLocked(now: now)
             logSummaryIfNeededLocked(now: now)
             if encodePressureMsLocked() != nil {
                 encodeHealthySinceValue = nil
             } else {
-                encodePressureStreak = 0
                 encodePressureSinceValue = nil
                 considerEncodeRecoveryLocked(now: now)
             }
@@ -393,28 +389,27 @@ public final class VideoTargetController: @unchecked Sendable {
         acknowledgedBytes: Int = 0,
         acknowledgedFrames: Int = 1,
         acknowledgementIntervalMs: Double = 0,
+        isApplicationLimited: Bool = false,
         now: Date = Date()
     ) {
         locked {
             lastClientQueueFeedbackValue = Self.normalizedClientQueueFeedback(clientQueue)
-            let windowBacklogged = lastAckWindow > 0 && unacked >= max(1, lastAckWindow - 1)
+            lastFrameAckAt = now
             updateAckDelayLocked(ackLatencyMs)
-            let pathBacklogged = windowBacklogged
-                || networkExcessAckDelayEmaMs > networkDelayBudgetMsLocked() * 0.5
-                || lastServerQueueDelayMsValue > 0
+            let pathBacklogged = !isApplicationLimited
+                && lastServerQueueDelayMsValue >= Self.serverQueueBudgetMs
             let deliveryRate = updateAcknowledgedBitrateLocked(
                 bytes: acknowledgedBytes,
                 intervalMs: acknowledgementIntervalMs,
                 now: now
             )
-            if deliveryRate > 0 {
+            if deliveryRate > 0, pathBacklogged {
                 acknowledgedBitrateSampleCount = min(
                     acknowledgedBitrateSampleCount + 1,
                     Self.minimumAcknowledgedBitrateSamples
                 )
-                if pathBacklogged,
-                   acknowledgedBitrateSampleCount >= Self.minimumAcknowledgedBitrateSamples {
-                    networkCapacityEmaBps = networkCapacityEmaBps == 0
+                if acknowledgedBitrateSampleCount >= Self.minimumAcknowledgedBitrateSamples {
+                    networkCapacityEmaBps = !isFresh(networkCapacityAt, now: now)
                         ? deliveryRate
                         : networkCapacityEmaBps * 0.75 + deliveryRate * 0.25
                     networkCapacityAt = now
@@ -428,7 +423,6 @@ public final class VideoTargetController: @unchecked Sendable {
                 ? acknowledgedBitrateEmaBps
                 : 0
             lastClientQueueDelayMsValue = clientQueueDelayLocked(drainBitrateBps: drainRate)
-            updateNetworkExcessAckDelayLocked(now: now)
             refreshFeedbackPressureLocked(now: now)
             considerNetworkStateLocked(now: now)
             considerClientPressureLocked(now: now)
@@ -453,16 +447,11 @@ public final class VideoTargetController: @unchecked Sendable {
         }
     }
 
-    public func noteClientRenderTiming(
-        commandDecodeMs: Int,
-        renderMs: Int,
-        now: Date = Date()
-    ) {
+    /// QoE is diagnostic; its command interval also contains receive waiting.
+    public func noteClientQoE(renderMs: Int, now: Date = Date()) {
         locked {
-            lastClientRenderMsValue = Double(max(commandDecodeMs, 0) + max(renderMs, 0))
+            lastClientRenderMsValue = Double(max(renderMs, 0))
             lastClientRenderAtValue = now
-            refreshFeedbackPressureLocked(now: now)
-            considerClientPressureLocked(now: now)
         }
     }
 
@@ -500,7 +489,6 @@ public final class VideoTargetController: @unchecked Sendable {
             guard !stallRecoveryModeValue,
                   let encodeMs = encodePressureMsLocked()
             else {
-                encodePressureStreak = 0
                 encodePressureSinceValue = nil
                 return
             }
@@ -514,11 +502,9 @@ public final class VideoTargetController: @unchecked Sendable {
             else {
                 return
             }
-            encodePressureStreak = 0
             let previousTargetFPS = targetFPSValue
             lowerFPSForEncodePressureLocked(encodeMs: encodeMs)
             lastAdaptationAtValue = now
-            encodeLimited = true
             if targetFPSValue < previousTargetFPS {
                 RDPLog.rdp.info(
                     "VideoTargetController: encode pressure -> \(self.targetFPSValue)fps / " +
@@ -528,26 +514,21 @@ public final class VideoTargetController: @unchecked Sendable {
         }
     }
 
-    /// Seeds RTT and a non-authoritative bandwidth estimate for queue timing.
-    /// Auto-detect never caps the video target by itself.
-    public func seedFromAutoDetect(
-        bandwidthKbps: UInt32,
-        rttMs: UInt32,
-        now: Date = Date()
-    ) {
+    /// Each auto-detection measurement is consumed once; RTT updates cannot
+    /// renew a previous bandwidth measurement.
+    public func updateAutoDetect(_ metrics: NetworkAutoDetect.Metrics, now: Date = Date()) {
         locked {
-            guard !stallRecoveryModeValue else { return }
-            if rttMs > 0 {
-                baseAckLatencyMs = Double(rttMs)
-                linkQualityScoreValue = Self.qualityFromRTT(Double(rttMs))
+            if metrics.rttMeasuredAtNanoseconds > lastRTTSampleNanoseconds {
+                lastRTTSampleNanoseconds = metrics.rttMeasuredAtNanoseconds
+                detectedRTTMs = Double(metrics.baseRTTMs)
+                detectedRTTAt = now
             }
-            if bandwidthKbps > 0 {
-                let measured = Double(bandwidthKbps) * 1_000
-                detectedBandwidthBps = detectedBandwidthBps == 0
-                    ? measured
-                    : detectedBandwidthBps * 0.75 + measured * 0.25
+            if metrics.bandwidthMeasuredAtNanoseconds > lastBandwidthSampleNanoseconds {
+                lastBandwidthSampleNanoseconds = metrics.bandwidthMeasuredAtNanoseconds
+                detectedBandwidthBps = Double(metrics.bandwidthKbps) * 1_000
                 detectedBandwidthAt = now
             }
+            refreshFeedbackPressureLocked(now: now)
         }
     }
 
@@ -560,6 +541,12 @@ public final class VideoTargetController: @unchecked Sendable {
         lastServerQueueDelayMsValue = 0
         lastClientRenderMsValue = 0
         lastClientRenderAtValue = nil
+        lastFrameAckAt = nil
+        lastEncodeAt = nil
+        detectedRTTMs = nil
+        detectedRTTAt = nil
+        lastRTTSampleNanoseconds = 0
+        lastBandwidthSampleNanoseconds = 0
         lastReportedBitrateValue = 0
         linkQualityScoreValue = 0.5
         networkPressureValue = 0
@@ -568,8 +555,6 @@ public final class VideoTargetController: @unchecked Sendable {
         pressureSourceValue = .none
         baseAckLatencyMs = nil
         excessAckDelayEmaMs = 0
-        currentExcessAckDelayMs = 0
-        networkExcessAckDelayEmaMs = 0
         acknowledgedBitrateEmaBps = 0
         networkCapacityEmaBps = 0
         acknowledgedFrameBytesEma = 0
@@ -582,9 +567,6 @@ public final class VideoTargetController: @unchecked Sendable {
         outputWindowBytes = 0
         encodeLatenciesMs.removeAll(keepingCapacity: true)
         ackLatenciesMs.removeAll(keepingCapacity: true)
-        encodeLimited = false
-        encodePressureStreak = 0
-        decoderLimited = false
         acknowledgedBitrateSampleCount = 0
         networkPressureSinceValue = nil
         networkHealthySinceValue = nil
@@ -634,6 +616,10 @@ public final class VideoTargetController: @unchecked Sendable {
             let preservedCapacity = networkCapacityEmaBps
             let preservedCapacityAt = networkCapacityAt
             let preservedFrameBytes = acknowledgedFrameBytesEma
+            let preservedRTT = detectedRTTMs
+            let preservedRTTAt = detectedRTTAt
+            let preservedRTTSample = lastRTTSampleNanoseconds
+            let preservedBandwidthSample = lastBandwidthSampleNanoseconds
             let preservedBaseAck = baseAckLatencyMs
             let preservedLinkState = linkState
             let preservedLinkQuality = linkQualityScoreValue
@@ -648,11 +634,13 @@ public final class VideoTargetController: @unchecked Sendable {
             networkCapacityEmaBps = preservedCapacity
             networkCapacityAt = preservedCapacityAt
             acknowledgedFrameBytesEma = preservedFrameBytes
+            detectedRTTMs = preservedRTT
+            detectedRTTAt = preservedRTTAt
+            lastRTTSampleNanoseconds = preservedRTTSample
+            lastBandwidthSampleNanoseconds = preservedBandwidthSample
             baseAckLatencyMs = preservedBaseAck
             linkState = preservedLinkState
             linkQualityScoreValue = preservedLinkQuality
-            encodeLimited = encoderFPSCap < configuredFPSValue
-            decoderLimited = decoderFPSCap < configuredFPSValue
 
             recomputeTargetsLocked()
         }
@@ -698,12 +686,10 @@ public final class VideoTargetController: @unchecked Sendable {
     ) {
         guard !stallRecoveryModeValue else { return }
 
-        let rttMs = estimatedRTTMsLocked()
+        let rttMs = estimatedRTTMsLocked(now: now)
         // A full application ACK window is expected during steady streaming.
         // It limits admission, but is not network congestion by itself.
-        let pathPressure = networkExcessAckDelayEmaMs / networkDelayBudgetMsLocked()
-        let serverQueuePressure = lastServerQueueDelayMsValue / Self.serverQueueBudgetMs
-        let pressure = max(pathPressure, serverQueuePressure)
+        let pressure = networkPressureValue
 
         if pressure >= 1 {
             networkHealthySinceValue = nil
@@ -724,7 +710,6 @@ public final class VideoTargetController: @unchecked Sendable {
 
         networkPressureSinceValue = nil
         let healthy = pressure < 0.25
-            && networkExcessAckDelayEmaMs <= networkDelayBudgetMsLocked() * 0.5
         guard healthy else {
             networkHealthySinceValue = nil
             return
@@ -761,29 +746,16 @@ public final class VideoTargetController: @unchecked Sendable {
     }
 
     private func lowerNetworkLoadLocked() {
-        switch adaptationPriorityValue {
-        case .qualityFirst:
-            if networkFPSCap > Self.minAdaptiveFPS {
-                networkFPSCap = max(
-                    Self.minAdaptiveFPS,
-                    networkFPSCap - max(1, networkFPSCap / 5)
-                )
-            } else {
-                lowerBitrateFromFeedbackLocked(floor: Self.minAdaptiveBitrate)
-            }
-        case .fpsFirst:
-            if networkBitrateCap > Self.minAdaptiveBitrate {
-                lowerBitrateFromFeedbackLocked(floor: Self.minAdaptiveBitrate)
-            } else {
-                networkFPSCap = max(
-                    Self.minAdaptiveFPS,
-                    networkFPSCap - max(1, networkFPSCap / 5)
-                )
-            }
+        lowerBitrateFromFeedbackLocked(floor: Self.minAdaptiveBitrate)
+        if adaptationPriorityValue == .qualityFirst || networkBitrateCap == Self.minAdaptiveBitrate {
+            networkFPSCap = max(
+                Self.minAdaptiveFPS,
+                networkFPSCap - max(1, networkFPSCap / 5)
+            )
         }
         recomputeTargetsLocked()
         RDPLog.rdp.info(
-            "VideoTargetController: congestion networkExcess=\(Int(self.networkExcessAckDelayEmaMs))ms " +
+            "VideoTargetController: congestion feedbackExcess=\(Int(self.excessAckDelayEmaMs))ms " +
             "serverQueue=\(Int(self.lastServerQueueDelayMsValue))ms -> " +
             "\(self.targetFPSValue)fps / \(self.targetBitrateValue / 1_000_000)Mbps"
         )
@@ -842,6 +814,11 @@ public final class VideoTargetController: @unchecked Sendable {
 
     private func considerClientPressureLocked(now: Date) {
         guard !stallRecoveryModeValue else { return }
+        guard isFresh(lastFrameAckAt, now: now) else {
+            clientPressureSinceValue = nil
+            decoderHealthySinceValue = nil
+            return
+        }
 
         if clientPressureValue >= 1 {
             decoderHealthySinceValue = nil
@@ -858,7 +835,8 @@ public final class VideoTargetController: @unchecked Sendable {
         }
 
         clientPressureSinceValue = nil
-        guard decoderLimited, linkState != .congested else {
+        guard decoderFPSCap < configuredFPSValue,
+              isFresh(lastFrameAckAt, now: now), linkState != .congested else {
             decoderHealthySinceValue = nil
             return
         }
@@ -873,7 +851,6 @@ public final class VideoTargetController: @unchecked Sendable {
             configuredFPSValue,
             decoderFPSCap + max(1, configuredFPSValue / 12)
         )
-        decoderLimited = decoderFPSCap < configuredFPSValue
         recomputeTargetsLocked()
         lastAdaptationAtValue = now
         decoderHealthySinceValue = now
@@ -881,13 +858,12 @@ public final class VideoTargetController: @unchecked Sendable {
 
     private func lowerFPSForEncodePressureLocked(encodeMs: Double) {
         let sustainable = Int(
-            (1000 / max(encodeMs, 1) * Self.encodeSustainableFPSRatio).rounded(.down)
+            (1000 / max(encodeMs, 1) * Self.encodePressureBudgetRatio).rounded(.down)
         )
         encoderFPSCap = max(
             Self.minAdaptiveFPS,
             min(encoderFPSCap, configuredFPSValue, sustainable)
         )
-        encodeLimited = true
         recomputeTargetsLocked()
     }
 
@@ -904,7 +880,7 @@ public final class VideoTargetController: @unchecked Sendable {
     }
 
     private func considerEncodeRecoveryLocked(now: Date) {
-        guard !stallRecoveryModeValue, encodeLimited,
+        guard !stallRecoveryModeValue, encoderFPSCap < configuredFPSValue,
               linkState != .congested else {
             encodeHealthySinceValue = nil
             return
@@ -928,7 +904,6 @@ public final class VideoTargetController: @unchecked Sendable {
             adaptationAllowedLocked(now: now)
         else { return }
         encoderFPSCap = candidate
-        encodeLimited = encoderFPSCap < configuredFPSValue
         recomputeTargetsLocked()
         lastAdaptationAtValue = now
         encodeHealthySinceValue = now
@@ -938,30 +913,16 @@ public final class VideoTargetController: @unchecked Sendable {
         let latency = max(latencyMs, 0)
         ackLatenciesMs.append(latency)
         if ackLatenciesMs.count > 64 { ackLatenciesMs.removeFirst() }
-        let sortedBaseline = ackLatenciesMs.sorted()
-        let baselineIndex = min(sortedBaseline.count - 1, sortedBaseline.count / 10)
-        baseAckLatencyMs = sortedBaseline[baselineIndex]
+        baseAckLatencyMs = min(baseAckLatencyMs ?? latency, latency)
         let excess = max(0, latency - (baseAckLatencyMs ?? latency))
-        currentExcessAckDelayMs = excess
-        excessAckDelayEmaMs = excessAckDelayEmaMs == 0
+        excessAckDelayEmaMs = ackLatenciesMs.count == 1
             ? excess
             : excessAckDelayEmaMs * 0.8 + excess * 0.2
     }
 
-    private func updateNetworkExcessAckDelayLocked(now: Date) {
-        let recentClientRender: Double
-        if let renderedAt = lastClientRenderAtValue,
-           now.timeIntervalSince(renderedAt) <= 1,
-           now >= renderedAt {
-            recentClientRender = lastClientRenderMsValue
-        } else {
-            recentClientRender = 0
-        }
-        let clientQueueDelay = lastClientQueueDelayMsValue ?? 0
-        let excess = max(0, currentExcessAckDelayMs - recentClientRender - clientQueueDelay)
-        networkExcessAckDelayEmaMs = networkExcessAckDelayEmaMs == 0
-            ? excess
-            : networkExcessAckDelayEmaMs * 0.8 + excess * 0.2
+    private func isFresh(_ measuredAt: Date?, now: Date, lifetime: TimeInterval = feedbackLifetime) -> Bool {
+        guard let measuredAt else { return false }
+        return max(0, now.timeIntervalSince(measuredAt)) <= lifetime
     }
 
     private func clientQueueDelayLocked(drainBitrateBps: Double) -> Double? {
@@ -977,26 +938,14 @@ public final class VideoTargetController: @unchecked Sendable {
     }
 
     private func estimatedServerDrainBitrateLocked(now: Date) -> Double {
-        let liveRates = [
-            (networkCapacityEmaBps, networkCapacityAt),
-            (acknowledgedBitrateEmaBps, acknowledgedBitrateAt),
-        ]
-        let freshRates = liveRates.compactMap { rate, updatedAt -> Double? in
-            guard rate > 0,
-                  let updatedAt,
-                  now >= updatedAt,
-                  now.timeIntervalSince(updatedAt) <= 5
-            else { return nil }
-            return rate
-        }
-        if let liveRate = freshRates.min() {
-            return max(liveRate, Double(Self.minAdaptiveBitrate))
+        if networkCapacityEmaBps > 0, isFresh(networkCapacityAt, now: now) {
+            return max(min(networkCapacityEmaBps, Double(targetBitrateValue)), Double(Self.minAdaptiveBitrate))
         }
         if let detectedBandwidthAt,
            now >= detectedBandwidthAt,
            now.timeIntervalSince(detectedBandwidthAt) <= 30,
            detectedBandwidthBps > 0 {
-            return max(detectedBandwidthBps, Double(Self.minAdaptiveBitrate))
+            return max(min(detectedBandwidthBps, Double(targetBitrateValue)), Double(Self.minAdaptiveBitrate))
         }
         return Double(max(targetBitrateValue, Self.minAdaptiveBitrate))
     }
@@ -1010,43 +959,32 @@ public final class VideoTargetController: @unchecked Sendable {
     }
 
     private func refreshFeedbackPressureLocked(now: Date) {
-        updateNetworkExcessAckDelayLocked(now: now)
-        let rttMs = estimatedRTTMsLocked()
         let frameBudgetMs = 1_000 / Double(max(targetFPSValue, 1))
-        // ACK-window occupancy is admission state, not a quality penalty.
-        let pathPressure = networkExcessAckDelayEmaMs / networkDelayBudgetMsLocked()
+        let ackIsFresh = isFresh(lastFrameAckAt, now: now)
+        let clientQueuePressure = ackIsFresh
+            ? (lastClientQueueDelayMsValue ?? 0) / max(estimatedRTTMsLocked(now: now), frameBudgetMs * 2)
+            : 0
+        // A known client backlog is client pressure. Do not also charge its
+        // graphics ACK delay to the network controller.
+        let pathPressure = ackIsFresh && clientQueuePressure < 1
+            ? excessAckDelayEmaMs / networkDelayBudgetMsLocked()
+            : 0
         let serverQueuePressure = lastServerQueueDelayMsValue / Self.serverQueueBudgetMs
         networkPressureValue = max(pathPressure, serverQueuePressure)
-
-        let clientQueuePressure = (lastClientQueueDelayMsValue ?? 0)
-            / max(rttMs, frameBudgetMs * 2)
-        let renderPressure = max(
-            0,
-            (lastClientRenderMsValue - frameBudgetMs) / max(frameBudgetMs, 1)
-        )
-        clientPressureValue = max(clientQueuePressure, renderPressure)
-
-        let encodePressure = encodePressureMsLocked().map {
-            max(0, $0 / max(frameBudgetMs, 1) - 1)
-        } ?? 0
-        encoderPressureValue = encodePressure
+        clientPressureValue = clientQueuePressure
+        encoderPressureValue = isFresh(lastEncodeAt, now: now)
+            ? (encodePressureMsLocked().map { $0 / (frameBudgetMs * Self.encodePressureBudgetRatio) } ?? 0)
+            : 0
 
         let pressures: [(VideoPressureSource, Double)] = [
             (.network, pathPressure),
             (.serverQueue, serverQueuePressure),
             (.clientQueue, clientQueuePressure),
-            (.decoder, renderPressure),
-            (.encoder, encodePressure),
+            (.encoder, encoderPressureValue),
         ]
-        let maximumPressure = pressures.map { $0.1 }.max() ?? 0
-        pressureSourceValue = maximumPressure > 0
-            ? (pressures.max { lhs, rhs in lhs.1 < rhs.1 }?.0 ?? .none)
-            : .none
-        let networkQuality = 1 - min(1, networkPressureValue)
-        let clientQuality = 1 - min(1, clientPressureValue)
-        let encoderQuality = 1 - min(1, encoderPressureValue)
-        let unackedQuality = 1.0
-        linkQualityScoreValue = min(networkQuality, clientQuality, encoderQuality, unackedQuality)
+        let strongest = pressures.max { $0.1 < $1.1 }
+        pressureSourceValue = strongest.map { $0.1 > 0 ? $0.0 : .none } ?? .none
+        linkQualityScoreValue = 1 - min(1, max(networkPressureValue, clientPressureValue, encoderPressureValue))
     }
 
     private func adaptationAllowedLocked(now: Date) -> Bool {
@@ -1054,9 +992,10 @@ public final class VideoTargetController: @unchecked Sendable {
         return now.timeIntervalSince(last) >= Self.adaptationCooldown
     }
 
-    private func qualityStateLocked() -> VideoLinkState {
+    private func qualityStateLocked(now: Date) -> VideoLinkState {
         let maximumPressure = max(networkPressureValue, clientPressureValue, encoderPressureValue)
-        if linkState == .congested || maximumPressure >= 1 { return .congested }
+        if stallRecoveryModeValue || maximumPressure >= 1 { return .congested }
+        if !isFresh(lastFrameAckAt, now: now), !isFresh(detectedRTTAt, now: now, lifetime: 30) { return .unknown }
         if linkState == .probing || maximumPressure >= 0.25 { return .probing }
         return .healthy
     }
@@ -1079,7 +1018,7 @@ public final class VideoTargetController: @unchecked Sendable {
     ) -> Double {
         guard bytes >= Self.minimumAcknowledgedBytes, intervalMs > 0 else { return 0 }
         let instant = Double(bytes) * 8_000 / intervalMs
-        acknowledgedBitrateEmaBps = acknowledgedBitrateEmaBps == 0
+        acknowledgedBitrateEmaBps = !isFresh(acknowledgedBitrateAt, now: now)
             ? instant
             : acknowledgedBitrateEmaBps * 0.75 + instant * 0.25
         acknowledgedBitrateAt = now
@@ -1135,8 +1074,6 @@ public final class VideoTargetController: @unchecked Sendable {
         networkFPSCap = configuredFPSValue
         encoderFPSCap = configuredFPSValue
         decoderFPSCap = configuredFPSValue
-        encodeLimited = false
-        decoderLimited = false
         networkPressureSinceValue = nil
         networkHealthySinceValue = nil
         clientPressureSinceValue = nil
@@ -1163,18 +1100,13 @@ public final class VideoTargetController: @unchecked Sendable {
         max(4, min(Self.encodePressureSampleWindow, configuredFPSValue / 4))
     }
 
-    private func estimatedRTTMsLocked() -> Double {
-        max(baseAckLatencyMs ?? (1_000 / Double(max(targetFPSValue, 1))), 1)
+    private func estimatedRTTMsLocked(now: Date = Date()) -> Double {
+        let rtt = isFresh(detectedRTTAt, now: now, lifetime: 30) ? detectedRTTMs : nil
+        return max(rtt ?? baseAckLatencyMs ?? (1_000 / Double(max(targetFPSValue, 1))), 1)
     }
 
     private func networkDelayBudgetMsLocked() -> Double {
         max(estimatedRTTMsLocked(), Self.networkDelayBudgetFloorMs)
-    }
-
-    private func estimatedFrameBytesLocked() -> Double {
-        let configuredFrameBytes = Double(max(targetBitrateValue, Self.minAdaptiveBitrate))
-            / Double(max(targetFPSValue, 1)) / 8
-        return max(configuredFrameBytes * 0.75, acknowledgedFrameBytesEma, 1)
     }
 
     private func recentAverageEncodeMsLocked(sampleCount: Int = 16) -> Double {
@@ -1208,7 +1140,8 @@ public final class VideoTargetController: @unchecked Sendable {
         lastClientDecodedFPSValue = clientDecodedFPS
         let ackAverage = ackLatenciesMs.isEmpty ? 0 : ackLatenciesMs.reduce(0, +) / Double(ackLatenciesMs.count)
         let stateLabel: String
-        switch linkState {
+        switch qualityStateLocked(now: now) {
+        case .unknown: stateLabel = "unknown"
         case .healthy: stateLabel = "healthy"
         case .congested: stateLabel = "congested"
         case .probing: stateLabel = "probing"
@@ -1225,7 +1158,7 @@ public final class VideoTargetController: @unchecked Sendable {
                 "age=%.1fms prep=%.1fms enc=%.1fms p95Enc=%.1fms post=%.1fms " +
                 "idr=%d drops=%d unacked=%d/%d " +
                 "clientQ=%@ clientQueue=%.0fms serverQ=%dB serverQueue=%.0fms " +
-                "render=%.0fms ack=%.0fms excess=%.0fms networkExcess=%.0fms " +
+                "render=%.0fms ack=%.0fms feedbackExcess=%.0fms " +
                 "linkQ=%.2f state=%@ source=%@ pressure=%.2f/%.2f/%.2f " +
                 "caps=%d/%d/%d stallRecovery=%@",
             captureFPS, wireFPS, clientDecodedFPS, targetFPSValue,
@@ -1237,8 +1170,8 @@ public final class VideoTargetController: @unchecked Sendable {
             idrSinceSummary, encodeDropsSinceSummary, lastServerUnacked, lastAckWindow,
             clientQueueLabel, lastClientQueueDelayMsValue ?? 0,
             lastServerQueueBytesValue, lastServerQueueDelayMsValue,
-            lastClientRenderMsValue, ackAverage, excessAckDelayEmaMs,
-            networkExcessAckDelayEmaMs, linkQualityScoreValue,
+            isFresh(lastClientRenderAtValue, now: now) ? lastClientRenderMsValue : 0, ackAverage,
+            excessAckDelayEmaMs, linkQualityScoreValue,
             stateLabel, pressureSourceValue.rawValue,
             networkPressureValue, clientPressureValue, encoderPressureValue,
             networkFPSCap, encoderFPSCap, decoderFPSCap,
@@ -1259,8 +1192,8 @@ public final class VideoTargetController: @unchecked Sendable {
 
     public struct PerfSnapshot: Sendable {
         public var avgEncodeMs: Double
-        public var avgAckRTTMs: Double
-        public var p95AckRTTMs: Double
+        public var avgFrameAckLatencyMs: Double
+        public var p95FrameAckLatencyMs: Double
         public var sampleCount: Int
         public var captureFPS: Double
         public var wireFPS: Double
@@ -1285,14 +1218,16 @@ public final class VideoTargetController: @unchecked Sendable {
         public var quality: VideoQualityStatus
     }
 
-    public var perfSnapshot: PerfSnapshot {
+    public func performanceSnapshot(now: Date = Date()) -> PerfSnapshot {
         locked {
+            refreshFeedbackPressureLocked(now: now)
+            let queueIsFresh = isFresh(lastFrameAckAt, now: now)
             let sorted = ackLatenciesMs.sorted()
             let p95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))]
             return PerfSnapshot(
                 avgEncodeMs: recentAverageEncodeMsLocked(sampleCount: encodeLatenciesMs.count),
-                avgAckRTTMs: sorted.isEmpty ? 0 : sorted.reduce(0, +) / Double(sorted.count),
-                p95AckRTTMs: p95,
+                avgFrameAckLatencyMs: sorted.isEmpty ? 0 : sorted.reduce(0, +) / Double(sorted.count),
+                p95FrameAckLatencyMs: p95,
                 sampleCount: sorted.count,
                 captureFPS: lastCaptureFPSValue,
                 wireFPS: lastWireFPSValue,
@@ -1301,11 +1236,11 @@ public final class VideoTargetController: @unchecked Sendable {
                 targetBitrate: targetBitrateValue,
                 configuredBitrate: configuredBitrateValue,
                 lastReportedBitrate: lastReportedBitrateValue,
-                clientQueue: lastClientQueueFeedbackValue,
-                clientQueueDelayMs: lastClientQueueDelayMsValue ?? 0,
+                clientQueue: queueIsFresh ? lastClientQueueFeedbackValue : .unavailable,
+                clientQueueDelayMs: queueIsFresh ? (lastClientQueueDelayMsValue ?? 0) : 0,
                 serverQueueBytes: lastServerQueueBytesValue,
                 serverQueueDelayMs: lastServerQueueDelayMsValue,
-                clientRenderMs: lastClientRenderMsValue,
+                clientRenderMs: isFresh(lastClientRenderAtValue, now: now) ? lastClientRenderMsValue : 0,
                 stallRecoveryMode: stallRecoveryModeValue,
                 bitrateReduced: bitrateReducedValue,
                 linkQualityScore: linkQualityScoreValue,
@@ -1315,7 +1250,7 @@ public final class VideoTargetController: @unchecked Sendable {
                 clientPressure: clientPressureValue,
                 encoderPressure: encoderPressureValue,
                 quality: VideoQualityStatus(
-                    state: qualityStateLocked(),
+                    state: qualityStateLocked(now: now),
                     linkState: linkState,
                     pressureSource: pressureSourceValue,
                     score: linkQualityScoreValue,
@@ -1324,10 +1259,10 @@ public final class VideoTargetController: @unchecked Sendable {
                     encoderPressure: encoderPressureValue,
                     serverQueueBytes: lastServerQueueBytesValue,
                     serverQueueDelayMs: lastServerQueueDelayMsValue,
-                    clientQueue: lastClientQueueFeedbackValue,
-                    clientQueueDelayMs: lastClientQueueDelayMsValue,
-                    clientRenderMs: lastClientRenderMsValue,
-                    ackExcessDelayMs: networkExcessAckDelayEmaMs,
+                    clientQueue: queueIsFresh ? lastClientQueueFeedbackValue : .unavailable,
+                    clientQueueDelayMs: queueIsFresh ? lastClientQueueDelayMsValue : nil,
+                    clientRenderMs: isFresh(lastClientRenderAtValue, now: now) ? lastClientRenderMsValue : 0,
+                    ackExcessDelayMs: excessAckDelayEmaMs,
                     targetFPS: targetFPSValue,
                     targetBitrate: targetBitrateValue
                 )
@@ -1337,10 +1272,6 @@ public final class VideoTargetController: @unchecked Sendable {
 
     static func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double {
         a + (b - a) * min(1, max(0, t))
-    }
-
-    static func qualityFromRTT(_ rttMs: Double) -> Double {
-        1 - min(1, max(0, (rttMs - 30) / 170))
     }
 
     static func queueDelayMs(queueBytes: Int?, drainBitrateBps: Double) -> Double? {

@@ -2,6 +2,16 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class FrameAckTrackerTests: XCTestCase {
+    func testACKDelayExcludesOurPacingButDeliveryIntervalIncludesTransmission() throws {
+        let tracker = FrameAckTracker()
+        tracker.track(frameId: 1, bytes: 10_000, nowNanoseconds: 1_000_000)
+        XCTAssertTrue(tracker.noteFrameWritten(frameId: 1, nowNanoseconds: 81_000_000))
+        let sample = try XCTUnwrap(tracker.acknowledge(upTo: 1, nowNanoseconds: 91_000_000))
+        XCTAssertEqual(sample.latencyMs, 10)
+        XCTAssertEqual(sample.acknowledgementIntervalMs, 90)
+        XCTAssertFalse(tracker.noteFrameWritten(frameId: 1, nowNanoseconds: 92_000_000))
+    }
+
     func testAcknowledgementMeasuresFromAcknowledgedFrameSend() throws {
         let tracker = FrameAckTracker()
         tracker.track(frameId: 1, bytes: 100, nowNanoseconds: 1_000_000)

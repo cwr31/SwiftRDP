@@ -74,6 +74,10 @@ enum L10n {
         case power
         case preventSystemSleep, preventSystemSleepHelp
         case preventDisplaySleep, preventDisplaySleepHelp
+        case remoteSessionSecurity, hostLoginPassword, hostLoginPasswordHelp
+        case saveHostLoginPassword, removeHostLoginPassword
+        case hostLoginPasswordSaved, hostLoginPasswordSaveFailed
+        case keepScreenUnlockedWhileConnected, keepUnlockedHelp
         case language
 
         // Display
@@ -133,7 +137,7 @@ enum L10n {
         case qualityStatus, qualityHealthy, qualityProbing, qualityCongested
         case qualityTarget, qualityQueue, qualityPressure, qualityUnknown, qualitySkipped
         case qualitySourceNetwork, qualitySourceServerQueue, qualitySourceClientQueue
-        case qualitySourceDecoder, qualitySourceEncoder
+        case qualitySourceEncoder
         case connectionsHistory, connectionsHistoryEmpty, connectionsHistoryTruncated
         case clearHistory
         case connectionsStateActive, connectionsStateConnecting
@@ -210,6 +214,15 @@ enum L10n {
             case .preventSystemSleepHelp: return "Keep the Mac awake while the RDP server is running (works with the lid closed)."
             case .preventDisplaySleep: return "Prevent Display Sleep"
             case .preventDisplaySleepHelp: return "Keep displays awake while the server is running. MacBooks keep the built-in panel on only while mirroring an awake physical display (not when clamshell virtual capture is active)."
+            case .remoteSessionSecurity: return "Remote Session Security"
+            case .hostLoginPassword: return "Mac Login Password"
+            case .hostLoginPasswordHelp: return "Stored in Keychain and used only to unlock this Mac after an authenticated RDP connection. It is separate from the RDP password."
+            case .saveHostLoginPassword: return "Save Password"
+            case .removeHostLoginPassword: return "Remove Password"
+            case .hostLoginPasswordSaved: return "Mac login password saved in Keychain."
+            case .hostLoginPasswordSaveFailed: return "Could not save the password in Keychain."
+            case .keepScreenUnlockedWhileConnected: return "Keep Screen Unlocked While Connected"
+            case .keepUnlockedHelp: return "Automatically unlock an idle Lock Screen on connect and keep the session active until disconnect. Requires Accessibility, RDP authentication, and a saved Mac login password."
             case .language: return "Language"
 
             case .sectionH264: return "H.264"
@@ -326,10 +339,9 @@ enum L10n {
             case .qualityPressure: return "%@ %.0f%%"
             case .qualityUnknown: return "unknown"
             case .qualitySkipped: return "Capture skipped %llu"
-            case .qualitySourceNetwork: return "Network"
+            case .qualitySourceNetwork: return "Transport"
             case .qualitySourceServerQueue: return "Server queue"
             case .qualitySourceClientQueue: return "Client queue"
-            case .qualitySourceDecoder: return "Decoder"
             case .qualitySourceEncoder: return "Encoder"
             case .connectionsHistory: return "History"
             case .connectionsHistoryEmpty: return "No connection history yet."
@@ -413,6 +425,15 @@ enum L10n {
             case .preventSystemSleepHelp: return "RDP 服务器运行时保持 Mac 不休眠（合盖后机器也可继续运行）。"
             case .preventDisplaySleep: return "防止屏幕休眠"
             case .preventDisplaySleepHelp: return "服务器运行期间保持显示器唤醒。MacBook 仅在镜像可用内建/外接物理屏时唤醒内建屏（合盖虚拟屏推流时不会强拉内屏）。"
+            case .remoteSessionSecurity: return "远程会话安全"
+            case .hostLoginPassword: return "Mac 登录密码"
+            case .hostLoginPasswordHelp: return "密码单独保存在钥匙串，仅在 RDP 连接认证成功后用于解锁这台 Mac。它与 RDP 密码相互独立。"
+            case .saveHostLoginPassword: return "保存密码"
+            case .removeHostLoginPassword: return "移除密码"
+            case .hostLoginPasswordSaved: return "Mac 登录密码已保存到钥匙串。"
+            case .hostLoginPasswordSaveFailed: return "无法将密码保存到钥匙串。"
+            case .keepScreenUnlockedWhileConnected: return "连接期间保持屏幕解锁"
+            case .keepUnlockedHelp: return "连接时自动解锁空闲锁屏，并在断开前保持会话活跃。需要辅助功能权限、RDP 身份验证和已保存的 Mac 登录密码。"
             case .language: return "语言"
 
             case .sectionH264: return "H.264"
@@ -529,10 +550,9 @@ enum L10n {
             case .qualityPressure: return "%@ %.0f%%"
             case .qualityUnknown: return "未知"
             case .qualitySkipped: return "捕获跳过 %llu 帧"
-            case .qualitySourceNetwork: return "网络"
+            case .qualitySourceNetwork: return "传输"
             case .qualitySourceServerQueue: return "服务端队列"
             case .qualitySourceClientQueue: return "客户端队列"
-            case .qualitySourceDecoder: return "解码器"
             case .qualitySourceEncoder: return "编码器"
             case .connectionsHistory: return "历史记录"
             case .connectionsHistoryEmpty: return "暂无连接历史。"

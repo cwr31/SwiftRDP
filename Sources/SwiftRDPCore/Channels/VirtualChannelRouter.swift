@@ -15,7 +15,7 @@ public final class VirtualChannelRouter {
     private var channels: [String: VirtualChannel] = [:]
     private var idToName: [UInt16: String] = [:]
     public var sendToChannel: ((UInt16, [UInt8]) -> Void)?
-    public var sendToChannelBatch: ((UInt16, [[UInt8]], RDPSocket.WritePriority) -> Int?)?
+    public var sendToChannelBatch: ((UInt16, [[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)?
 
     /// Negotiated CHANNEL_CHUNK_LENGTH (server Demand Active default: 16256).
     public var chunkSize: Int = ChannelPDU.defaultChunkSize
@@ -194,7 +194,7 @@ public final class VirtualChannelRouter {
             }
         }
         if let drdynvc = channel as? DrdynvcChannel {
-            drdynvc.sendBatch = { [weak self, weak drdynvc] bodies, priority in
+            drdynvc.sendBatch = { [weak self, weak drdynvc] bodies, priority, onWritten in
                 guard let self, let drdynvc,
                       let channelId = self.idToName.first(where: { $0.value == drdynvc.name })?.key
                 else { return nil }
@@ -202,11 +202,12 @@ public final class VirtualChannelRouter {
                     ChannelPDU.chunk($0, chunkSize: self.chunkSize)
                 }
                 if let sendToChannelBatch = self.sendToChannelBatch {
-                    return sendToChannelBatch(channelId, framedBodies, priority)
+                    return sendToChannelBatch(channelId, framedBodies, priority, onWritten)
                 }
                 for body in framedBodies {
                     self.sendToChannel?(channelId, body)
                 }
+                onWritten?(DispatchTime.now().uptimeNanoseconds)
                 return framedBodies.reduce(0) { $0 + $1.count }
             }
         }

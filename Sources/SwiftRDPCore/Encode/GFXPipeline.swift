@@ -50,6 +50,7 @@ public final class GFXPipeline: @unchecked Sendable {
     private var width = 0
     private var height = 0
     private var frameId: UInt32 = 0
+    private var lastQoEFrameId: UInt32?
     private var running = false
     private var surfacesReady = false
     /// Suppress Output — pause GFX send without teardown.
@@ -107,12 +108,8 @@ public final class GFXPipeline: @unchecked Sendable {
     /// A dropped picture is encoder backpressure, not a reference-chain failure.
     /// Retry at the next frame boundary without creating a keyframe burst.
     private static let h264DropRetryDelayMaximum: TimeInterval = 0.25
-    private var lastH264WireAt = Date.distantPast
     private var h264DropResumeNotBefore = Date.distantPast
     private var audioQueuePressure = false
-    /// True when a GFX frame was wired recently (AutoDetect deferral).
-    public private(set) var desktopRecentlyHot = false
-    private var desktopHotClearTask: Task<Void, Never>?
 
     /// True when the single encode/send reservation is occupied.
     public var isEncodeInFlight: Bool {
@@ -331,6 +328,7 @@ public final class GFXPipeline: @unchecked Sendable {
         consecutiveBackpressure = 0
         consecutiveEncodeFailures = 0
         frameId = 0
+        lastQoEFrameId = nil
         resetUnacked()
         stateLock.unlock()
         queueRFXReset()
@@ -351,7 +349,8 @@ public final class GFXPipeline: @unchecked Sendable {
     private func emitGraphics(
         _ pdus: [[UInt8]],
         compress: Bool = true,
-        priority: RDPSocket.WritePriority = .control
+        priority: RDPSocket.WritePriority = .control,
+        onWritten: RDPSocket.WriteCompletion? = nil
     ) -> Int? {
         stateLock.lock()
         let transport = self.transport
@@ -360,8 +359,17 @@ public final class GFXPipeline: @unchecked Sendable {
         return transport.sendGraphicsPDUs(
             pdus,
             compress: compress,
-            priority: priority
+            priority: priority,
+            onWritten: onWritten
         )
+    }
+
+    private func noteFrameWritten(_ frameId: UInt32, generation: UInt64, at time: UInt64) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard pipelineGeneration == generation,
+              ackTracker.noteFrameWritten(frameId: frameId, nowNanoseconds: time) else { return }
+        lastAckTime = Date()
     }
 
     /// True after client CAPS_ADVERTISE → CAPS_CONFIRM → CREATE_SURFACE (frames may be sent).
@@ -507,6 +515,7 @@ public final class GFXPipeline: @unchecked Sendable {
         graphicsInitialized = false
         sendPaused = false
         frameId = 0
+        lastQoEFrameId = nil
         needsBootstrapIDR = false
         bootstrapIDRFrameId = nil
         keyframeInFlight = false
@@ -571,13 +580,13 @@ public final class GFXPipeline: @unchecked Sendable {
         sendBlocked = blocked
         stateLock.unlock()
         RDPLog.gfx.info(
-            "GFX: TCP send path \(blocked ? "blocked" : "writable") — " +
+            "GFX: output admission \(blocked ? "blocked" : "writable") — " +
             "encode admission \(blocked ? "paused" : "resumed")"
         )
         onWorkAvailable?()
     }
 
-    private struct EncodeReservation {
+    private struct EncodeReservation: Sendable {
         let generation: UInt64
         let requiresIDR: Bool
         let width: Int
@@ -588,7 +597,7 @@ public final class GFXPipeline: @unchecked Sendable {
         var prepMs: Double = 0
     }
 
-    private struct RFXReservation {
+    private struct RFXReservation: Sendable {
         let generation: UInt64
         let width: Int
         let height: Int
@@ -878,18 +887,6 @@ public final class GFXPipeline: @unchecked Sendable {
         return .submitted
     }
 
-    private func noteDesktopHot() {
-        lastH264WireAt = Date()
-        desktopRecentlyHot = true
-        desktopHotClearTask?.cancel()
-        desktopHotClearTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            guard !Task.isCancelled, let self else { return }
-            self.desktopRecentlyHot = Date().timeIntervalSince(self.lastH264WireAt) < 0.75
-            // Avoid NSLock from async Task (Swift 6); Bool write is atomic enough here.
-        }
-    }
-
     private func sendEncodedFrame(
         _ encoded: H264Encoder.EncodedAccessUnit,
         left: UInt16, top: UInt16, right: UInt16, bottom: UInt16,
@@ -999,6 +996,10 @@ public final class GFXPipeline: @unchecked Sendable {
         // Build START/END under the lock (tiny); construct the large WIRE PDU off-lock.
         let startPDU = buildStartFrame(frameId: outboundFrameId)
         let endPDU = buildEndFrame(frameId: outboundFrameId)
+        if expectsFrameAcknowledgements {
+            if ackTracker.count == 0 { lastAckTime = Date() }
+            ackTracker.track(frameId: outboundFrameId)
+        }
         stateLock.unlock()
 
         let wirePDU = buildWireToSurface1(
@@ -1011,7 +1012,10 @@ public final class GFXPipeline: @unchecked Sendable {
         guard let wireBytes = emitGraphics(
             [startPDU, wirePDU, endPDU],
             compress: false,
-            priority: .video
+            priority: .video,
+            onWritten: { [weak self] time in
+                self?.noteFrameWritten(outboundFrameId, generation: reservation.generation, at: time)
+            }
         ) else {
             stateLock.lock()
             if pipelineGeneration == reservation.generation {
@@ -1027,10 +1031,7 @@ public final class GFXPipeline: @unchecked Sendable {
         }
 
         stateLock.lock()
-        if expectsFrameAcknowledgements {
-            if ackTracker.count == 0 { lastAckTime = Date() }
-            ackTracker.track(frameId: outboundFrameId, bytes: wireBytes)
-        }
+        ackTracker.updateBytes(frameId: outboundFrameId, bytes: wireBytes)
         stateLock.unlock()
 
         let postEncodeMs = (CFAbsoluteTimeGetCurrent() - postStart) * 1000
@@ -1056,7 +1057,6 @@ public final class GFXPipeline: @unchecked Sendable {
         controller?.noteEncodePressure()
         consecutiveEncodeFailures = 0
         h264DropResumeNotBefore = .distantPast
-        noteDesktopHot()
         noteUnacknowledgedDepth()
         if containsIDR {
             h264.noteIDR()
@@ -1190,6 +1190,10 @@ public final class GFXPipeline: @unchecked Sendable {
         let outboundFrameId = frameId
         let startPDU = buildStartFrame(frameId: outboundFrameId)
         let endPDU = buildEndFrame(frameId: outboundFrameId)
+        if expectsFrameAcknowledgements {
+            if ackTracker.count == 0 { lastAckTime = Date() }
+            ackTracker.track(frameId: outboundFrameId)
+        }
         stateLock.unlock()
 
         let wirePDU = buildProgressiveWireToSurface(
@@ -1199,7 +1203,10 @@ public final class GFXPipeline: @unchecked Sendable {
         guard let wireBytes = emitGraphics(
             [startPDU, wirePDU, endPDU],
             compress: true,
-            priority: .video
+            priority: .video,
+            onWritten: { [weak self] time in
+                self?.noteFrameWritten(outboundFrameId, generation: reservation.generation, at: time)
+            }
         ) else {
             stateLock.lock()
             if pipelineGeneration == reservation.generation {
@@ -1214,10 +1221,7 @@ public final class GFXPipeline: @unchecked Sendable {
         }
 
         stateLock.lock()
-        if expectsFrameAcknowledgements {
-            if ackTracker.count == 0 { lastAckTime = Date() }
-            ackTracker.track(frameId: outboundFrameId, bytes: wireBytes)
-        }
+        ackTracker.updateBytes(frameId: outboundFrameId, bytes: wireBytes)
         stateLock.unlock()
 
         stateLock.lock()
@@ -1402,11 +1406,11 @@ public final class GFXPipeline: @unchecked Sendable {
                 "GFX: QOE frameId=\(ackFrame) commandDecode=\(commandDecodeMs)ms render=\(renderMs)ms"
             )
             stateLock.lock()
-            controller?.noteClientRenderTiming(
-                commandDecodeMs: Int(commandDecodeMs),
-                renderMs: Int(renderMs)
-            )
-            applyLiveCaps()
+            if FrameAckTracker.isSerialNumberAtOrBefore(ackFrame, frameId),
+               lastQoEFrameId.map({ FrameAckTracker.isSerialNumberAtOrAfter(ackFrame, $0) }) ?? true {
+                lastQoEFrameId = ackFrame
+                controller?.noteClientQoE(renderMs: Int(renderMs))
+            }
             stateLock.unlock()
         case 0x0010: // CACHE_IMPORT_OFFER
             RDPLog.gfx.info("GFX: CACHE_IMPORT_OFFER (\(data.count)B)")
@@ -1732,6 +1736,7 @@ public final class GFXPipeline: @unchecked Sendable {
         acknowledgementsSuspended: Bool,
         totalFramesDecoded: UInt32
     ) {
+        guard FrameAckTracker.isSerialNumberAtOrBefore(frameId, self.frameId) else { return }
         controller?.noteClientDecodedFrame(totalFramesDecoded: totalFramesDecoded)
         if acknowledgementsSuspended {
             // MS-RDPEGFX 3.2.5.13: clear all unacknowledged frames and stop
@@ -1758,8 +1763,10 @@ public final class GFXPipeline: @unchecked Sendable {
         let resumed = !expectsFrameAcknowledgements
         expectsFrameAcknowledgements = true
         let sample = ackTracker.acknowledge(upTo: frameId)
-        lastAckTime = Date()
-        consecutiveBackpressure = 0
+        if sample != nil || resumed {
+            lastAckTime = Date()
+            consecutiveBackpressure = 0
+        }
 
         let acknowledgedBootstrapIDR = bootstrapIDRFrameId.map {
             FrameAckTracker.isSerialNumberAtOrAfter(frameId, $0)
@@ -1774,12 +1781,12 @@ public final class GFXPipeline: @unchecked Sendable {
         }
 
         guard let controller else { return }
-        controller.exitStallRecoveryIfPossible()
         guard let sample else {
             RDPLog.gfx.debug("GFX: FRAME_ACK frame=\(frameId) has no tracked send sample")
             applyLiveCaps()
             return
         }
+        controller.exitStallRecoveryIfPossible()
         RDPLog.gfx.debug(String(format: "GFX: FRAME_ACK received frameId=%u ackLatency=%.1fms", frameId, sample.latencyMs))
         controller.noteFrameAck(
             clientQueue: clientQueue,
@@ -1787,7 +1794,8 @@ public final class GFXPipeline: @unchecked Sendable {
             unacked: sample.unacked,
             acknowledgedBytes: sample.acknowledgedBytes,
             acknowledgedFrames: sample.acknowledgedFrameCount,
-            acknowledgementIntervalMs: sample.acknowledgementIntervalMs
+            acknowledgementIntervalMs: sample.acknowledgementIntervalMs,
+            isApplicationLimited: sample.isApplicationLimited
         )
         applyLiveCaps()
     }

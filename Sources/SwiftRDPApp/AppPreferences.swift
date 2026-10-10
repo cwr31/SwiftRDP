@@ -41,6 +41,7 @@ final class AppPreferences: ObservableObject {
         static let keyboardBindings = prefix + "keyboardBindings"
         static let preventSystemSleep = prefix + "preventSystemSleep"
         static let preventDisplaySleep = prefix + "preventDisplaySleep"
+        static let keepScreenUnlockedWhileConnected = prefix + "keepScreenUnlockedWhileConnected"
     }
 
     @Published var serverPort: Int {
@@ -232,6 +233,7 @@ final class AppPreferences: ObservableObject {
     /// True when server is listening (UI state; not persisted).
     /// Live-apply power assertions (no restart).
     var applyPowerAssertionsLiveHandler: ((Bool, Bool) -> Void)?
+    var applyKeepScreenUnlockedLiveHandler: ((Bool) -> Void)?
 
     @Published var preventSystemSleep: Bool {
         didSet {
@@ -243,6 +245,12 @@ final class AppPreferences: ObservableObject {
         didSet {
             defaults.set(preventDisplaySleep, forKey: Key.preventDisplaySleep)
             applyPowerAssertionsLiveHandler?(preventSystemSleep, preventDisplaySleep)
+        }
+    }
+    @Published var keepScreenUnlockedWhileConnected: Bool {
+        didSet {
+            defaults.set(keepScreenUnlockedWhileConnected, forKey: Key.keepScreenUnlockedWhileConnected)
+            applyKeepScreenUnlockedLiveHandler?(keepScreenUnlockedWhileConnected)
         }
     }
 
@@ -280,6 +288,7 @@ final class AppPreferences: ObservableObject {
             d.set(2.0, forKey: Key.remotePointerScale)
             d.set(true, forKey: Key.preventSystemSleep)
             d.set(false, forKey: Key.preventDisplaySleep)
+            d.set(false, forKey: Key.keepScreenUnlockedWhileConnected)
         }
 
         let resolvedPassword: String
@@ -331,10 +340,14 @@ final class AppPreferences: ObservableObject {
         // Defaults: keep Mac awake for RDP; allow panel blank (lid / idle).
         preventSystemSleep = d.object(forKey: Key.preventSystemSleep) as? Bool ?? true
         preventDisplaySleep = d.object(forKey: Key.preventDisplaySleep) as? Bool ?? false
+        keepScreenUnlockedWhileConnected = d.object(
+            forKey: Key.keepScreenUnlockedWhileConnected
+        ) as? Bool ?? false
         // Persist so toggles and defaults are visible in the plist immediately.
         d.set(audioPlaybackDestination.rawValue, forKey: Key.audioPlaybackDestination)
         d.set(preventSystemSleep, forKey: Key.preventSystemSleep)
         d.set(preventDisplaySleep, forKey: Key.preventDisplaySleep)
+        d.set(keepScreenUnlockedWhileConnected, forKey: Key.keepScreenUnlockedWhileConnected)
 
         RDPLog.verbose = devLog
         L10n.setLanguage(appLanguage)

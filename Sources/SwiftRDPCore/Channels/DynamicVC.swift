@@ -31,7 +31,7 @@ public final class DynamicVCManager {
     /// Outbound DRDYNVC bytes on the static `drdynvc` channel.
     public var send: (([UInt8]) -> Void)?
     /// Batched outbound DVC PDUs, used to enqueue one complete video frame atomically.
-    public var sendBatch: (([[UInt8]], RDPSocket.WritePriority) -> Int?)?
+    public var sendBatch: (([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)?
 
     private var nextChannelId: UInt32 = 1
     private var channelsById: [UInt32: Channel] = [:]
@@ -548,7 +548,8 @@ public final class DynamicVCManager {
     public func sendDataBatch(
         channelId: UInt32,
         payloads: [[UInt8]],
-        priority: RDPSocket.WritePriority
+        priority: RDPSocket.WritePriority,
+        onWritten: RDPSocket.WriteCompletion? = nil
     ) -> Int? {
         guard !payloads.isEmpty, (send != nil || sendBatch != nil) else { return nil }
 
@@ -565,9 +566,10 @@ public final class DynamicVCManager {
         }
         let sentBytes: Int?
         if let sendBatch {
-            sentBytes = sendBatch(pdus, priority)
+            sentBytes = sendBatch(pdus, priority, onWritten)
         } else if let send {
             for pdu in pdus { send(pdu) }
+            onWritten?(DispatchTime.now().uptimeNanoseconds)
             sentBytes = pdus.reduce(0) { $0 + $1.count }
         } else {
             sentBytes = nil
@@ -685,7 +687,7 @@ public final class DrdynvcChannel: VirtualChannel {
     public let name = "drdynvc"
     public let manager: DynamicVCManager
     public var send: (([UInt8]) -> Void)?
-    public var sendBatch: (([[UInt8]], RDPSocket.WritePriority) -> Int?)?
+    public var sendBatch: (([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)?
 
     public init(manager: DynamicVCManager = DynamicVCManager()) {
         self.manager = manager
@@ -694,12 +696,13 @@ public final class DrdynvcChannel: VirtualChannel {
     public func onOpen(channelId: UInt16) {
         RDPLog.channels.debug("drdynvc open \(channelId)")
         manager.send = { [weak self] pdu in self?.send?(pdu) }
-        manager.sendBatch = { [weak self] pdus, priority in
+        manager.sendBatch = { [weak self] pdus, priority, onWritten in
             guard let self else { return nil }
             if let sendBatch = self.sendBatch {
-                return sendBatch(pdus, priority)
+                return sendBatch(pdus, priority, onWritten)
             }
             for pdu in pdus { self.send?(pdu) }
+            onWritten?(DispatchTime.now().uptimeNanoseconds)
             return pdus.reduce(0) { $0 + $1.count }
         }
         // CAPS is sent from RDPSession after Confirm Active (session path),

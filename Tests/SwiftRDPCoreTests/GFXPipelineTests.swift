@@ -6,13 +6,64 @@ import XCTest
 final class GFXPipelineTests: XCTestCase {
     private let zgfxDecoder = ZGFXCompressor()
 
+    func testFutureACKCannotClearTrackedFrames() throws {
+        let pipeline = GFXPipeline()
+        attach(pipeline) { _ in }
+        pipeline.asyncEncoding = false
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 2))
+        XCTAssertEqual(pipeline.unackedFrameCount, 1)
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        XCTAssertEqual(pipeline.unackedFrameCount, 0)
+    }
+
+    func testOnlyTrackedACKExitsStallRecovery() throws {
+        let pipeline = GFXPipeline()
+        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        pipeline.attachController(controller)
+        attach(pipeline) { _ in }
+        pipeline.asyncEncoding = false
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        _ = controller.noteBackpressureTimeout(unackedWas: 2)
+        _ = controller.noteBackpressureTimeout(unackedWas: 2)
+        pipeline.handleClientPDU(frameAck(frameId: 0))
+        XCTAssertTrue(controller.stallRecoveryMode)
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        XCTAssertFalse(controller.stallRecoveryMode)
+    }
+
+    func testQoECommandIntervalDoesNotBecomeDecoderPressure() throws {
+        let pipeline = GFXPipeline()
+        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        pipeline.attachController(controller)
+        attach(pipeline) { _ in }
+        pipeline.asyncEncoding = false
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        pipeline.handleClientPDU(qoeFrameAck(frameId: 1, commandDecodeMs: 2000, renderMs: 10))
+        XCTAssertEqual(controller.performanceSnapshot().clientRenderMs, 10)
+        XCTAssertEqual(controller.performanceSnapshot().clientPressure, 0)
+        XCTAssertEqual(controller.targetFPS, 60)
+        pipeline.handleClientPDU(qoeFrameAck(frameId: 2, commandDecodeMs: 0, renderMs: 5000))
+        XCTAssertEqual(controller.performanceSnapshot().clientRenderMs, 10)
+    }
+
     private func attach(
         _ pipeline: GFXPipeline,
         send: @escaping ([UInt8]) -> Void
     ) {
         pipeline.attach(
-            transport: RDPGFXDynamicChannelTransport { pdus, _ in
+            transport: RDPGFXDynamicChannelTransport { pdus, _, onWritten in
                 for pdu in pdus { send(pdu) }
+                onWritten?(DispatchTime.now().uptimeNanoseconds)
                 return pdus.reduce(0) { $0 + $1.count }
             }
         )

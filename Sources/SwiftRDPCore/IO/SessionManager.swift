@@ -55,6 +55,8 @@ public final class SessionManager: @unchecked Sendable {
     /// App-provided durable settings lookup. Called after client identity is known,
     /// immediately before the desktop is created.
     public var rememberedSettingsProvider: (@Sendable (SessionClientIdentity) -> RememberedSessionSettings?)?
+    public var onAuthenticatedSessionStarted: ((UUID) -> Void)?
+    public var onAuthenticatedSessionEnded: ((UUID) -> Void)?
 
     public init(config: ServerConfig, audit: ConnectionAudit = .shared) {
         self.config = config
@@ -468,6 +470,7 @@ public final class SessionManager: @unchecked Sendable {
             outcome: .active,
             detail: "Desktop session active"
         )
+        onAuthenticatedSessionStarted?(session.id)
         return true
     }
 
@@ -610,6 +613,10 @@ public final class SessionManager: @unchecked Sendable {
                     durationSeconds: duration
                 )
             }
+        }
+
+        if wasActive {
+            onAuthenticatedSessionEnded?(session.id)
         }
 
         if shouldDestroySharedVD { scheduleVirtualDisplayDestroy() }
@@ -789,8 +796,8 @@ public final class SessionManager: @unchecked Sendable {
         public var clientName: String
         public var width: Int
         public var height: Int
-        public var avgAckRTTMs: Double
-        public var p95AckRTTMs: Double
+        public var avgFrameAckLatencyMs: Double
+        public var p95FrameAckLatencyMs: Double
         public var avgEncodeMs: Double
         public var captureFPS: Double
         public var wireFPS: Double
@@ -828,8 +835,8 @@ public final class SessionManager: @unchecked Sendable {
             clientName: "",
             width: 0,
             height: 0,
-            avgAckRTTMs: 0,
-            p95AckRTTMs: 0,
+            avgFrameAckLatencyMs: 0,
+            p95FrameAckLatencyMs: 0,
             avgEncodeMs: 0,
             captureFPS: 0,
             wireFPS: 0,
@@ -872,7 +879,7 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     private func makeSnapshot(session: RDPSession) -> ConnectionSnapshot {
-        let perf = session.videoController.perfSnapshot
+        let perf = session.videoController.performanceSnapshot()
         let captureStats = session.sharedCapture?.captureStatistics
         let name = session.info.clientName
         let w = session.info.width > 0 ? session.info.width : session.clientWidth
@@ -882,8 +889,8 @@ public final class SessionManager: @unchecked Sendable {
             clientName: name,
             width: w,
             height: h,
-            avgAckRTTMs: perf.avgAckRTTMs,
-            p95AckRTTMs: perf.p95AckRTTMs,
+            avgFrameAckLatencyMs: perf.avgFrameAckLatencyMs,
+            p95FrameAckLatencyMs: perf.p95FrameAckLatencyMs,
             avgEncodeMs: perf.avgEncodeMs,
             captureFPS: perf.captureFPS,
             wireFPS: perf.wireFPS,

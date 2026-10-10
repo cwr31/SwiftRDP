@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var observedSessionID: UUID?
     private var instanceLockFD: Int32 = -1
     private let hostAudioSuppressor = HostAudioSuppressor()
+    private let remoteSessionSecurityController = RemoteSessionSecurityController()
 
     private var prefs: AppPreferences { .shared }
 
@@ -61,6 +62,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 preventDisplaySleep: display
             )
         }
+        prefs.applyKeepScreenUnlockedLiveHandler = { [weak self] enabled in
+            self?.applyRemoteSessionSecurity(enabled: enabled)
+        }
 
         DispatchQueue.main.async {
             if !PermissionGate.allGranted {
@@ -83,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         sessionPollTimer?.invalidate()
         hostAudioSuppressor.setSuppressed(false)
+        remoteSessionSecurityController.update(enabled: false, sessionID: nil)
         if let manager = sessionManager {
             Task { await manager.stop() }
         }
@@ -219,6 +224,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         manager.rememberedSettingsProvider = { identity in
             rememberedStore.settings(for: identity)
         }
+        manager.onAuthenticatedSessionStarted = { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.remoteSessionSecurityController.update(
+                    enabled: self.prefs.keepScreenUnlockedWhileConnected && self.prefs.authEnabled,
+                    sessionID: sessionID
+                )
+            }
+        }
+        manager.onAuthenticatedSessionEnded = { [weak self] sessionID in
+            Task { @MainActor [weak self] in
+                self?.remoteSessionSecurityController.sessionEnded(sessionID)
+            }
+        }
         VirtualDisplayManager.setPowerPolicy(
             preventSystemSleep: prefs.preventSystemSleep,
             preventDisplaySleep: prefs.preventDisplaySleep
@@ -266,6 +285,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             prefs.isServerRestarting = false
             updateRuntimeState()
         }
+    }
+
+    private func applyRemoteSessionSecurity(enabled: Bool) {
+        guard let manager = sessionManager, manager.hasActiveSession else {
+            remoteSessionSecurityController.update(enabled: false, sessionID: nil)
+            return
+        }
+        remoteSessionSecurityController.update(
+            enabled: enabled && prefs.authEnabled,
+            sessionID: manager.connectionSnapshot.sessionID
+        )
     }
 
     private func startSessionPolling() {

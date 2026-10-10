@@ -20,49 +20,18 @@ public final class NIOInboundHandler: ChannelInboundHandler {
     public typealias InboundIn = ByteBuffer
     public typealias OutboundOut = ByteBuffer
 
-    private struct OutboundQueue {
-        private var storage: [[UInt8]] = []
-        private var head = 0
-        private(set) var byteCount = 0
-
-        var isEmpty: Bool { head >= storage.count }
-
-        mutating func append(_ bytes: [UInt8]) {
-            storage.append(bytes)
-            byteCount += bytes.count
-        }
-
-        mutating func popFirst() -> [UInt8]? {
-            guard head < storage.count else { return nil }
-            let bytes = storage[head]
-            head += 1
-            byteCount -= bytes.count
-            compactIfNeeded()
-            return bytes
-        }
-
-        mutating func removeAll() {
-            storage.removeAll(keepingCapacity: false)
-            head = 0
-            byteCount = 0
-        }
-
-        private mutating func compactIfNeeded() {
-            guard head > 64, head * 2 >= storage.count else { return }
-            storage = Array(storage[head...])
-            head = 0
-        }
-    }
-
     private let session: RDPSession
     private let sslContext: NIOSSLContext
     private var sslAdded = false
     private var handshakeTimeoutTask: Scheduled<Void>?
     private let outboundLock = NSLock()
-    private var pendingAudioWrites = OutboundQueue()
-    private var pendingControlWrites = OutboundQueue()
-    private var pendingVideoWrites = OutboundQueue()
+    private var pendingAudioWrites = OutboundWriteQueue()
+    private var pendingControlWrites = OutboundWriteQueue()
+    private var pendingGraphicsWrites = OutboundWriteQueue()
     private var outboundDrainScheduled = false
+    private var pacedDrainTask: Scheduled<Void>?
+    private var videoPacer = VideoBytePacer()
+    private var inFlightWriteBytes = 0
 
     private static let audioBatchByteLimit = 8 * 1024
     private static let controlBatchByteLimit = 64 * 1024
@@ -71,6 +40,7 @@ public final class NIOInboundHandler: ChannelInboundHandler {
     private static let maxQueuedAudioBytes = 256 * 1024
     private static let maxQueuedControlBytes = 4 * 1024 * 1024
     private static let maxVideoWriteBytes = 16 * 1024 * 1024
+    private static let maxQueuedVideoFrames = 2
 
     public init(session: RDPSession, sslContext: NIOSSLContext) {
         self.session = session
@@ -95,9 +65,9 @@ public final class NIOInboundHandler: ChannelInboundHandler {
             RDPLog.io.info("NIO: handshake timeout — closing unauthenticated connection")
             context.close(promise: nil)
         }
-        session.socket.onPrioritizedWrite = { [weak self, weak context] bytes, priority in
+        session.socket.onPrioritizedWrite = { [weak self, weak context] bytes, priority, onWritten in
             guard let self, let context else { return false }
-            return self.enqueueOutbound(bytes, priority: priority, context: context)
+            return self.enqueueOutbound(bytes, priority: priority, onWritten: onWritten, context: context)
         }
         session.socket.onClose = { [weak context] in
             context?.eventLoop.execute {
@@ -108,11 +78,14 @@ public final class NIOInboundHandler: ChannelInboundHandler {
 
     @discardableResult
     private func enqueueOutbound(
-        _ bytes: [UInt8],
+        _ packets: [[UInt8]],
         priority: RDPSocket.WritePriority,
+        onWritten: RDPSocket.WriteCompletion?,
         context: ChannelHandlerContext
     ) -> Bool {
-        guard !bytes.isEmpty else { return true }
+        let packets = packets.filter { !$0.isEmpty }
+        let byteCount = packets.reduce(0) { $0 + $1.count }
+        guard byteCount > 0 else { return true }
 
         var droppedAudioBytes = 0
         var queuedBytes: Int?
@@ -122,49 +95,61 @@ public final class NIOInboundHandler: ChannelInboundHandler {
         outboundLock.lock()
         switch priority {
         case .audio:
-            guard bytes.count <= Self.maxQueuedAudioBytes else {
+            guard byteCount <= Self.maxQueuedAudioBytes else {
                 outboundLock.unlock()
                 return false
             }
-            while pendingAudioWrites.byteCount + bytes.count > Self.maxQueuedAudioBytes,
+            while pendingAudioWrites.byteCount + byteCount > Self.maxQueuedAudioBytes,
                   let dropped = pendingAudioWrites.popFirst()
             {
-                droppedAudioBytes += dropped.count
+                droppedAudioBytes += dropped.bytes.count
             }
-            pendingAudioWrites.append(bytes)
+            pendingAudioWrites.append(packets, onWritten: onWritten)
         case .control:
-            let controlBytes = pendingControlWrites.byteCount + bytes.count
+            let controlBytes = pendingControlWrites.byteCount + byteCount
             if controlBytes > Self.maxQueuedControlBytes {
                 accepted = false
                 closeForControlOverflow = true
             } else {
-                pendingControlWrites.append(bytes)
-                queuedBytes = pendingControlWrites.byteCount + pendingVideoWrites.byteCount
+                pendingControlWrites.append(packets, onWritten: onWritten)
+                queuedBytes = pendingControlWrites.byteCount + pendingGraphicsWrites.byteCount + inFlightWriteBytes
+            }
+        case .graphicsControl:
+            if pendingGraphicsWrites.controlByteCount + byteCount > Self.maxQueuedControlBytes {
+                accepted = false
+                closeForControlOverflow = true
+            } else {
+                pendingGraphicsWrites.append(packets, onWritten: onWritten)
+                queuedBytes = pendingControlWrites.byteCount + pendingGraphicsWrites.byteCount + inFlightWriteBytes
             }
         case .video:
             let videoLimit = session.videoOutboundQueueLimitBytes
-            if bytes.count > Self.maxVideoWriteBytes || !pendingVideoWrites.isEmpty {
+            if byteCount > Self.maxVideoWriteBytes
+                || pendingGraphicsWrites.videoFrameCount >= Self.maxQueuedVideoFrames
+                || packets.contains(where: { $0.count > Self.videoBatchByteLimit }) {
                 accepted = false
-                droppedVideoBytes = bytes.count
+                droppedVideoBytes = byteCount
             } else {
-                // A single encoded frame may exceed the time budget. It is still
-                // safe to admit as one atomic item; the gate pauses the next frame.
-                pendingVideoWrites.append(bytes)
-                queuedBytes = pendingControlWrites.byteCount + pendingVideoWrites.byteCount
+                // Admit the complete frame once. Its packets are paced and cannot
+                // be rejected halfway through the H.264 reference chain.
+                pendingGraphicsWrites.append(packets, isVideo: true, onWritten: onWritten)
+                queuedBytes = pendingControlWrites.byteCount + pendingGraphicsWrites.byteCount + inFlightWriteBytes
                 if queuedBytes ?? 0 > videoLimit {
                     RDPLog.io.debug(
-                        "NIO: admitted oversized video frame \(bytes.count)B " +
+                        "NIO: admitted oversized video frame \(byteCount)B " +
                         "above \(videoLimit)B time budget"
                     )
                 }
             }
         }
-        let shouldSchedule = accepted && !outboundDrainScheduled
+        let shouldSchedule = accepted && (!outboundDrainScheduled || priority != .video)
+        session.setVideoFrameQueueFull(pendingGraphicsWrites.videoFrameCount >= Self.maxQueuedVideoFrames)
         if shouldSchedule {
             outboundDrainScheduled = true
         }
         outboundLock.unlock()
 
+        session.updateGFXTCPBackpressure()
         if let queuedBytes {
             session.setNIOOutboundQueueBytes(queuedBytes)
         }
@@ -175,7 +160,7 @@ public final class NIOInboundHandler: ChannelInboundHandler {
 
         if let droppedVideoBytes {
             RDPLog.io.debug(
-                "NIO: dropped video frame \(droppedVideoBytes)B — video queue is busy or frame is too large"
+                "NIO: dropped video frame \(droppedVideoBytes)B — frame queue is full or frame is too large"
             )
         }
 
@@ -209,6 +194,8 @@ public final class NIOInboundHandler: ChannelInboundHandler {
     /// event loop while avoiding one flush per GFX fragment.
     private func drainOutbound(context: ChannelHandlerContext) {
         guard context.eventLoop.inEventLoop else { return }
+        pacedDrainTask?.cancel()
+        pacedDrainTask = nil
         guard context.channel.isWritable else {
             outboundLock.lock()
             outboundDrainScheduled = false
@@ -222,11 +209,25 @@ public final class NIOInboundHandler: ChannelInboundHandler {
         var audioBytes = 0
         var controlBytes = 0
         var videoBytes = 0
+        var videoWaitNanoseconds: UInt64 = 0
 
-        func write(_ bytes: [UInt8]) {
+        func write(_ packet: (bytes: [UInt8], onWritten: RDPSocket.WriteCompletion?), tracksQueue: Bool) {
+            let bytes = packet.bytes
             var buffer = context.channel.allocator.buffer(capacity: bytes.count)
             buffer.writeBytes(bytes)
-            context.write(NIOAny(buffer), promise: nil)
+            let promise = tracksQueue || packet.onWritten != nil ? context.eventLoop.makePromise(of: Void.self) : nil
+            let byteCount = bytes.count
+            promise?.futureResult.whenComplete { [weak self] result in
+                if case .success = result { packet.onWritten?(DispatchTime.now().uptimeNanoseconds) }
+                guard tracksQueue, let self else { return }
+                self.outboundLock.lock()
+                self.inFlightWriteBytes = max(0, self.inFlightWriteBytes - byteCount)
+                let queued = self.pendingControlWrites.byteCount + self.pendingGraphicsWrites.byteCount
+                    + self.inFlightWriteBytes
+                self.outboundLock.unlock()
+                self.session.setNIOOutboundQueueBytes(queued)
+            }
+            context.write(NIOAny(buffer), promise: promise)
             wroteBytes += bytes.count
         }
 
@@ -239,8 +240,8 @@ public final class NIOInboundHandler: ChannelInboundHandler {
                 let next = pendingAudioWrites.popFirst()
                 outboundLock.unlock()
                 if let next {
-                    write(next)
-                    audioBytes += next.count
+                    write(next, tracksQueue: false)
+                    audioBytes += next.bytes.count
                 }
                 continue
             }
@@ -248,21 +249,33 @@ public final class NIOInboundHandler: ChannelInboundHandler {
                controlBytes < Self.controlBatchByteLimit
             {
                 let next = pendingControlWrites.popFirst()
+                if let next { inFlightWriteBytes += next.bytes.count }
                 outboundLock.unlock()
                 if let next {
-                    write(next)
-                    controlBytes += next.count
+                    write(next, tracksQueue: true)
+                    controlBytes += next.bytes.count
                 }
                 continue
             }
-            if context.channel.isWritable, !pendingVideoWrites.isEmpty,
-               videoBytes < Self.videoBatchByteLimit
+            if context.channel.isWritable, !pendingGraphicsWrites.isEmpty,
+               pendingGraphicsWrites.firstByteCount <= Self.videoBatchByteLimit - videoBytes
             {
-                let next = pendingVideoWrites.popFirst()
+                videoWaitNanoseconds = pendingGraphicsWrites.firstIsVideo
+                    ? videoPacer.reserve(
+                        bytes: pendingGraphicsWrites.firstByteCount,
+                        bitrate: session.videoController.targetBitrate,
+                        now: DispatchTime.now().uptimeNanoseconds
+                    ) : 0
+                if videoWaitNanoseconds > 0 {
+                    outboundLock.unlock()
+                    break
+                }
+                let next = pendingGraphicsWrites.popFirst()
+                if let next { inFlightWriteBytes += next.bytes.count }
                 outboundLock.unlock()
                 if let next {
-                    write(next)
-                    videoBytes += next.count
+                    write(next, tracksQueue: true)
+                    videoBytes += next.bytes.count
                 }
                 continue
             } else {
@@ -279,16 +292,28 @@ public final class NIOInboundHandler: ChannelInboundHandler {
         outboundLock.lock()
         let hasPending = !pendingAudioWrites.isEmpty
             || !pendingControlWrites.isEmpty
-            || !pendingVideoWrites.isEmpty
-        let queuedBytes = pendingControlWrites.byteCount + pendingVideoWrites.byteCount
+            || !pendingGraphicsWrites.isEmpty
+        let queuedBytes = pendingControlWrites.byteCount + pendingGraphicsWrites.byteCount + inFlightWriteBytes
+        let urgent = !pendingAudioWrites.isEmpty || !pendingControlWrites.isEmpty
+        session.setVideoFrameQueueFull(pendingGraphicsWrites.videoFrameCount >= Self.maxQueuedVideoFrames)
         let shouldSchedule = hasPending && context.channel.isWritable
         outboundDrainScheduled = shouldSchedule
         outboundLock.unlock()
         session.setNIOOutboundQueueBytes(queuedBytes)
+        session.updateGFXTCPBackpressure()
         if shouldSchedule {
-            context.eventLoop.execute { [weak self, weak context] in
-                guard let self, let context else { return }
-                self.drainOutbound(context: context)
+            if !urgent, videoWaitNanoseconds > 0 {
+                pacedDrainTask = context.eventLoop.scheduleTask(
+                    in: .nanoseconds(Int64(max(videoWaitNanoseconds, 2_000_000)))
+                ) { [weak self, weak context] in
+                    guard let self, let context else { return }
+                    self.drainOutbound(context: context)
+                }
+            } else {
+                context.eventLoop.execute { [weak self, weak context] in
+                    guard let self, let context else { return }
+                    self.drainOutbound(context: context)
+                }
             }
         }
     }
@@ -358,13 +383,17 @@ public final class NIOInboundHandler: ChannelInboundHandler {
     public func channelInactive(context: ChannelHandlerContext) {
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
+        pacedDrainTask?.cancel()
+        pacedDrainTask = nil
         outboundLock.lock()
         pendingAudioWrites.removeAll()
         pendingControlWrites.removeAll()
-        pendingVideoWrites.removeAll()
+        pendingGraphicsWrites.removeAll()
+        inFlightWriteBytes = 0
         outboundDrainScheduled = false
         outboundLock.unlock()
         session.setNIOOutboundQueueBytes(0)
+        session.setVideoFrameQueueFull(false)
         RDPLog.io.info("Client disconnected")
         RDPLog.io.debug("NIO: channelInactive / peer closed")
         session.terminate()

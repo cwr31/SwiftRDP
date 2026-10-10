@@ -53,7 +53,7 @@ final class VirtualChannelRouterTests: XCTestCase {
     func testDynamicVCBatchKeepsStaticChannelFraming() {
         let router = VirtualChannelRouter()
         var batches: [[[UInt8]]] = []
-        router.sendToChannelBatch = { _, payloads, _ in
+        router.sendToChannelBatch = { _, payloads, _, _ in
             batches.append(payloads)
             return payloads.reduce(0) { $0 + $1.count }
         }

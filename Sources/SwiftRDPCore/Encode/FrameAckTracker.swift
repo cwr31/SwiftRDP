@@ -6,6 +6,7 @@ struct FrameAckSample: Equatable {
     let acknowledgedBytes: Int
     let acknowledgedFrameCount: Int
     let acknowledgementIntervalMs: Double
+    let isApplicationLimited: Bool
 }
 
 /// Tracks GFX frame send times so FRAME_ACK latency is measured from the
@@ -14,8 +15,10 @@ final class FrameAckTracker {
     private static let serialNumberHalfRange: UInt32 = 0x8000_0000
     private let lock = NSLock()
     private struct Entry {
-        let sentAtNanoseconds: UInt64
-        let bytes: Int
+        let enqueuedAtNanoseconds: UInt64
+        var sentAtNanoseconds: UInt64
+        var bytes: Int
+        let isApplicationLimited: Bool
     }
 
     private var entries: [UInt32: Entry] = [:]
@@ -45,7 +48,12 @@ final class FrameAckTracker {
         nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
         lock.lock()
-        entries[frameId] = Entry(sentAtNanoseconds: nowNanoseconds, bytes: max(bytes, 0))
+        entries[frameId] = Entry(
+            enqueuedAtNanoseconds: nowNanoseconds,
+            sentAtNanoseconds: nowNanoseconds,
+            bytes: max(bytes, 0),
+            isApplicationLimited: entries.isEmpty
+        )
         lock.unlock()
     }
 
@@ -53,6 +61,21 @@ final class FrameAckTracker {
         lock.lock()
         entries.removeValue(forKey: frameId)
         lock.unlock()
+    }
+
+    @discardableResult
+    func noteFrameWritten(frameId: UInt32, nowNanoseconds: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard entries[frameId] != nil else { return false }
+        entries[frameId]?.sentAtNanoseconds = nowNanoseconds
+        return true
+    }
+
+    func updateBytes(frameId: UInt32, bytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries[frameId]?.bytes = max(bytes, 0)
     }
 
     func acknowledge(
@@ -73,9 +96,12 @@ final class FrameAckTracker {
             return nil
         }
         let acknowledgedBytes = acknowledgedIds.reduce(0) { $0 + (entries[$1]?.bytes ?? 0) }
-        let intervalStart = lastAcknowledgementNanoseconds
-            ?? acknowledgedIds.compactMap { entries[$0]?.sentAtNanoseconds }.min()
-            ?? measured.sentAtNanoseconds
+        let firstSend = acknowledgedIds.compactMap { entries[$0]?.enqueuedAtNanoseconds }.min()
+            ?? measured.enqueuedAtNanoseconds
+        let intervalStart = max(lastAcknowledgementNanoseconds ?? firstSend, firstSend)
+        let applicationLimited = acknowledgedIds.allSatisfy {
+            entries[$0]?.isApplicationLimited == true
+        }
         for id in acknowledgedIds {
             entries.removeValue(forKey: id)
         }
@@ -91,7 +117,8 @@ final class FrameAckTracker {
             unacked: entries.count,
             acknowledgedBytes: acknowledgedBytes,
             acknowledgedFrameCount: acknowledgedIds.count,
-            acknowledgementIntervalMs: Double(acknowledgementInterval) / 1_000_000
+            acknowledgementIntervalMs: Double(acknowledgementInterval) / 1_000_000,
+            isApplicationLimited: applicationLimited
         )
     }
 

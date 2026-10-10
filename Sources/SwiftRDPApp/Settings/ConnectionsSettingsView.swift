@@ -218,6 +218,7 @@ private struct LiveQualityStatusView: View {
 
     private var stateTitle: String {
         switch quality.state {
+        case .unknown: return L10n.t(.qualityUnknown)
         case .healthy: return L10n.t(.qualityHealthy)
         case .probing: return L10n.t(.qualityProbing)
         case .congested: return L10n.t(.qualityCongested)
@@ -226,6 +227,7 @@ private struct LiveQualityStatusView: View {
 
     private var stateIcon: String {
         switch quality.state {
+        case .unknown: return "questionmark.circle"
         case .healthy: return "checkmark.circle.fill"
         case .probing: return "waveform.path.ecg"
         case .congested: return "exclamationmark.triangle.fill"
@@ -234,6 +236,7 @@ private struct LiveQualityStatusView: View {
 
     private var stateColor: Color {
         switch quality.state {
+        case .unknown: return .secondary
         case .healthy: return .green
         case .probing: return .orange
         case .congested: return .red

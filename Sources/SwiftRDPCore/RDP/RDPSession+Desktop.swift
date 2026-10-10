@@ -81,6 +81,7 @@ extension RDPSession {
             ? (display.displayID == 0 ? nil : display.displayID)
             : DisplayTopology.physicalDisplayID(preferredIdentity: config.selectedDisplayIdentity)
         sharedCapture.attach(
+            owner: id,
             captureFPS: max(videoController.targetFPS, 1),
             capturesAudio: sendsAudioToController,
             onFrameAvailable: { [weak self] in
@@ -162,19 +163,24 @@ extension RDPSession {
             }
             // Capture + input loop: wake on new frames and retain FPS pacing.
             RDPLog.rdp.info("Display: desktop encode loop started")
+            var pacer = VideoFramePacer()
             while let self, !Task.isCancelled, self.phase == .active {
                 self.applyCaptureTargetFPS()
                 self.gfx.targetFPS = max(self.videoController.targetFPS, 1)
                 let fps = self.gfx.effectiveFPS
                 let periodNs = 1_000_000_000 / UInt64(fps)
                 let tickStart = DispatchTime.now().uptimeNanoseconds
+                let remaining = pacer.remainingWaitNanoseconds(fps: fps, now: tickStart)
+                if remaining > 0 {
+                    await self.waitForCaptureWake(timeoutNs: remaining)
+                    continue
+                }
 
                 let encoded = self.pushFrameReturningEncoded()
 
                 let elapsed = DispatchTime.now().uptimeNanoseconds &- tickStart
                 if encoded {
-                    // Pace to target FPS and wake on the next SCKit sample when it
-                    // arrives sooner. The pipeline owns one bounded encode slot.
+                    pacer.noteSubmission(at: tickStart)
                     if elapsed < periodNs {
                         await self.waitForCaptureWake(timeoutNs: periodNs - elapsed)
                     }
@@ -434,11 +440,12 @@ extension RDPSession {
             self.gfx.attachController(self.videoController)
             self.gfx.attach(
                 transport: RDPGFXDynamicChannelTransport(
-                    sendFrame: { [weak self] payloads, priority in
+                    sendFrame: { [weak self] payloads, priority, onWritten in
                         self?.vcRouter.dynamicVC.sendDataBatch(
                             channelId: channelId,
                             payloads: payloads,
-                            priority: priority
+                            priority: priority,
+                            onWritten: onWritten
                         )
                     }
                 )

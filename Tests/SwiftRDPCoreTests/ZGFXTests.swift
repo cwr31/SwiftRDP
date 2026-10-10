@@ -74,7 +74,7 @@ final class ZGFXTests: XCTestCase {
         var framePDUs: [[UInt8]] = []
         var framePriority: RDPSocket.WritePriority?
         let transport = RDPGFXDynamicChannelTransport(
-            sendFrame: { pdus, priority in
+            sendFrame: { pdus, priority, _ in
                 framePDUs = pdus
                 framePriority = priority
                 return pdus.reduce(0) { $0 + $1.count }
@@ -97,7 +97,7 @@ final class ZGFXTests: XCTestCase {
         let manager = DynamicVCManager()
         var batches: [[[UInt8]]] = []
         var priority: RDPSocket.WritePriority?
-        manager.sendBatch = { pdus, receivedPriority in
+        manager.sendBatch = { pdus, receivedPriority, _ in
             batches.append(pdus)
             priority = receivedPriority
             return pdus.reduce(0) { $0 + $1.count }
