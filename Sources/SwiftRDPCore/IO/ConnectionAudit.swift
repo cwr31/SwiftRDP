@@ -60,6 +60,7 @@ public struct LiveClientSnapshot: Identifiable, Sendable, Equatable {
     public var userName: String
     public var clientName: String
     public var securityLabel: String
+    public var transportLabel: String = "TCP"
     public var phaseLabel: String
     public var width: Int
     public var height: Int

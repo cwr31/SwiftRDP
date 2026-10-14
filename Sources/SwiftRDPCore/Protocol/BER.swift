@@ -87,12 +87,6 @@ enum BER {
         [tagSequence] + encodeLength(contents.count) + contents
     }
 
-    static func encodeTagged(_ tagNumber: UInt8, constructed: Bool, contents: [UInt8]) -> [UInt8] {
-        // Context-specific: class 10, constructed bit
-        let t: UInt8 = 0x80 | (constructed ? 0x20 : 0x00) | (tagNumber & 0x1F)
-        return [t] + encodeLength(contents.count) + contents
-    }
-
     static func encodeContext(_ tagNumber: UInt8, contents: [UInt8], constructed: Bool = true) -> [UInt8] {
         let t: UInt8 = 0x80 | (constructed ? 0x20 : 0x00) | (tagNumber & 0x1F)
         return [t] + encodeLength(contents.count) + contents

@@ -1,148 +1,63 @@
 import SwiftUI
 
-enum SettingsSection: String, CaseIterable, Identifiable, Hashable {
-    case general
-    case connections
-    case display
-    case input
-    case audio
-    case session
-    case permissions
-    case logs
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .general: return L10n.t(.sectionGeneral)
-        case .connections: return L10n.t(.sectionConnections)
-        case .display: return L10n.t(.sectionDisplay)
-        case .input: return L10n.t(.sectionInput)
-        case .audio: return L10n.t(.sectionAudio)
-        case .session: return L10n.t(.sectionSession)
-        case .permissions: return L10n.t(.sectionPermissions)
-        case .logs: return L10n.t(.sectionLogs)
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .general: return "gearshape"
-        case .connections: return "point.3.connected.trianglepath.dotted"
-        case .display: return "display"
-        case .input: return "computermouse"
-        case .audio: return "speaker.wave.2"
-        case .session: return "macwindow.on.rectangle"
-        case .permissions: return "lock.shield"
-        case .logs: return "doc.text"
-        }
-    }
-
-}
-
 struct SettingsRootView: View {
     @ObservedObject var prefs: AppPreferences
-    @ObservedObject var coordinator: SettingsCoordinator
-
-    private var selection: Binding<SettingsSection> {
-        Binding(
-            get: { coordinator.section ?? .general },
-            set: { coordinator.section = $0 }
-        )
-    }
+    @Bindable var settings: SettingsState
 
     var body: some View {
-        TabView(selection: selection) {
-            TabSection(L10n.t(.settingsGroupServer)) {
-                Tab(
-                    SettingsSection.general.title,
-                    systemImage: SettingsSection.general.systemImage,
-                    value: SettingsSection.general
-                ) {
-                    tabPage(for: .general)
-                }
-                Tab(
-                    SettingsSection.connections.title,
-                    systemImage: SettingsSection.connections.systemImage,
-                    value: SettingsSection.connections
-                ) {
-                    tabPage(for: .connections)
-                }
-            }
-
-            TabSection(L10n.t(.settingsGroupExperience)) {
-                Tab(
-                    SettingsSection.display.title,
-                    systemImage: SettingsSection.display.systemImage,
-                    value: SettingsSection.display
-                ) {
-                    tabPage(for: .display)
-                }
-                Tab(
-                    SettingsSection.input.title,
-                    systemImage: SettingsSection.input.systemImage,
-                    value: SettingsSection.input
-                ) {
-                    tabPage(for: .input)
-                }
-                Tab(
-                    SettingsSection.audio.title,
-                    systemImage: SettingsSection.audio.systemImage,
-                    value: SettingsSection.audio
-                ) {
-                    tabPage(for: .audio)
-                }
-                Tab(
-                    SettingsSection.session.title,
-                    systemImage: SettingsSection.session.systemImage,
-                    value: SettingsSection.session
-                ) {
-                    tabPage(for: .session)
-                }
-            }
-
-            TabSection(L10n.t(.settingsGroupSupport)) {
-                Tab(
-                    SettingsSection.permissions.title,
-                    systemImage: SettingsSection.permissions.systemImage,
-                    value: SettingsSection.permissions
-                ) {
-                    tabPage(for: .permissions)
-                }
-                Tab(
-                    SettingsSection.logs.title,
-                    systemImage: SettingsSection.logs.systemImage,
-                    value: SettingsSection.logs
-                ) {
-                    tabPage(for: .logs)
-                }
-            }
-        }
-        .tabViewStyle(.sidebarAdaptable)
-        .toolbar {
-            if coordinator.restartPending && prefs.isServerRunning && !prefs.isServerRestarting {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        coordinator.restartPending = false
-                        prefs.applyAndRestartHandler?()
-                    } label: {
-                        Label(L10n.t(.restartServer), systemImage: "arrow.triangle.2.circlepath")
+        NavigationSplitView {
+            List(selection: Binding($settings.section)) {
+                ForEach(SettingsSectionGroup.all) { group in
+                    Section(L10n.t(group.title)) {
+                        ForEach(group.sections) { section in
+                            Label {
+                                Text(section.title)
+                            } icon: {
+                                Image(systemName: section.systemImage)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .tag(section)
+                        }
                     }
                 }
             }
-        }
-        .onChange(of: prefs.isServerRunning) { _, running in
-            if !running {
-                coordinator.restartPending = false
-            }
-        }
-        .frame(minWidth: 760, idealWidth: 900, minHeight: 540, idealHeight: 680)
-    }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(200)
+        } detail: {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 16) {
+                    Text(settings.section.title)
+                        .font(.title2.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .gesture(WindowDragGesture())
+                        .allowsWindowActivationEvents(true)
 
-    @ViewBuilder
-    private func tabPage(for section: SettingsSection) -> some View {
-        page(for: section)
-            .navigationTitle(section.title)
+                    if settings.restartPending && prefs.isServerRunning && !prefs.isServerRestarting {
+                        Button {
+                            settings.restartPending = false
+                            prefs.applyAndRestartHandler?()
+                        } label: {
+                            Label(L10n.t(.restartServer), systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 16)
+
+                Divider()
+
+                page(for: settings.section)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .navigationTitle(settings.section.title)
+        }
+        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 780, idealWidth: 960, minHeight: 560, idealHeight: 680)
     }
 
     @ViewBuilder
@@ -172,10 +87,10 @@ struct SettingsRootView: View {
     }
 
     private func markRestartNeeded() {
-        coordinator.restartPending = coordinator.section != nil && prefs.isServerRunning
+        settings.restartPending = prefs.isServerRunning
     }
 
     private func clearRestartPending() {
-        coordinator.restartPending = false
+        settings.restartPending = false
     }
 }

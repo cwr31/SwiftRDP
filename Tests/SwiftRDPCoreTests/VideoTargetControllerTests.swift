@@ -3,8 +3,8 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class VideoTargetControllerTests: XCTestCase {
-    func testStartsAtConfiguredTargets() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+    func testMeasuredPathStartsAtConfiguredTargets() {
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
 
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
         XCTAssertEqual(controller.targetFPS, 60)
@@ -12,7 +12,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testFrameAckQueueUsesProtocolStates() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
 
         acknowledge(controller, queue: .unavailable, latency: 30)
         XCTAssertEqual(controller.clientQueueFeedback, .unavailable)
@@ -40,7 +40,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testUnavailableQueueDoesNotCreateSyntheticDelay() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
 
         acknowledge(
             controller,
@@ -55,7 +55,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testClientQueuePressureDoesNotReduceNetworkBitrate() {
-        let controller = VideoTargetController(
+        let controller = makeMeasuredVideoController(
             bitrate: 20_000_000,
             fps: 60,
             adaptationPriority: .fpsFirst
@@ -87,7 +87,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testServerQueueUsesTimeBudgetAndReducesNetworkLoad() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         let queuedBytes = Int(20_000_000.0 * 0.2 / 8.0)
 
@@ -102,30 +102,8 @@ final class VideoTargetControllerTests: XCTestCase {
         XCTAssertEqual(controller.performanceSnapshot().pressureSource, .serverQueue)
     }
 
-    func testBackloggedAckSamplesOverrideAutoDetectRateForQueueDelay() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
-        let start = Date()
-        seed(controller, bandwidthKbps: 100_000, rttMs: 10, now: start)
-        controller.noteServerQueue(bytes: 500_000, now: start)
-
-        for index in 0..<3 {
-            controller.noteFrameAck(
-                clientQueue: .unavailable,
-                ackLatencyMs: 10,
-                unacked: 1,
-                acknowledgedBytes: 25_000,
-                acknowledgementIntervalMs: 100,
-                isApplicationLimited: false,
-                now: start.addingTimeInterval(1 + Double(index) * 0.1)
-            )
-        }
-        controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(1.2))
-
-        XCTAssertGreaterThan(controller.lastServerQueueDelayMs, 1_000)
-    }
-
     func testServerQueueDelayIsBoundedByPacingRate() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         seed(controller, bandwidthKbps: 100_000, rttMs: 10)
 
         controller.noteServerQueue(bytes: 500_000)
@@ -137,9 +115,18 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testExpiredAutoDetectRateDoesNotLimitNetworkAdaptation() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         seed(controller, bandwidthKbps: 5_000, rttMs: 10, now: start)
+        // Healthy feedback can probe above the initial measurement. Its stale
+        // value must then stop limiting the estimated local queue drain rate.
+        for index in 0..<64 {
+            let time = start.addingTimeInterval(Double(index) * 0.4)
+            noteVideoDemand(controller, interval: 0.4, now: time)
+            acknowledge(controller, queue: .unavailable, latency: 20,
+                at: time)
+        }
+        XCTAssertEqual(controller.targetBitrate, 20_000_000)
 
         controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(31))
 
@@ -147,11 +134,10 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testFullAckWindowWithHealthyAcksDoesNotCreateNetworkPressure() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         controller.noteEncodedFrame(
             bytes: 100_000,
-            fps: 60,
             serverUnacked: 1,
             ackWindow: 2,
             now: start
@@ -176,12 +162,11 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testNetworkPressureRequiresTimeDwellBeforeAdapting() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         seedHealthy(controller, at: start)
         controller.noteEncodedFrame(
             bytes: 100_000,
-            fps: 60,
             serverUnacked: 0,
             ackWindow: 2,
             now: start
@@ -190,7 +175,7 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             unacked: 0,
             at: start.addingTimeInterval(1)
         )
@@ -199,7 +184,7 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             unacked: 0,
             at: start.addingTimeInterval(1.1)
         )
@@ -208,7 +193,7 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             unacked: 0,
             at: start.addingTimeInterval(1.6)
         )
@@ -216,20 +201,20 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testNetworkSpikeCannotAdaptMoreThanOncePerCooldown() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         seedHealthy(controller, at: start)
 
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             at: start.addingTimeInterval(1)
         )
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             at: start.addingTimeInterval(1.6)
         )
         let firstReducedFPS = controller.targetFPS
@@ -238,7 +223,7 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             at: start.addingTimeInterval(1.61)
         )
         XCTAssertEqual(controller.targetFPS, firstReducedFPS)
@@ -246,14 +231,14 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             at: start.addingTimeInterval(2.11)
         )
         XCTAssertLessThan(controller.targetFPS, firstReducedFPS)
     }
 
     func testSingleLowAckSampleCannotCollapseBitrate() {
-        let controller = VideoTargetController(
+        let controller = makeMeasuredVideoController(
             bitrate: 20_000_000,
             fps: 60,
             adaptationPriority: .fpsFirst
@@ -264,7 +249,7 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             at: start.addingTimeInterval(1),
             acknowledgedBytes: 5_000,
             intervalMs: 100
@@ -272,7 +257,7 @@ final class VideoTargetControllerTests: XCTestCase {
         acknowledge(
             controller,
             queue: .unavailable,
-            latency: 220,
+            latency: 600,
             at: start.addingTimeInterval(1.6),
             acknowledgedBytes: 5_000,
             intervalMs: 100
@@ -283,7 +268,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testQualityFirstReducesBitrateAndFPSOnFirstCongestionStep() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         controller.noteServerQueue(bytes: 500_000, now: start)
         controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(0.6))
@@ -293,7 +278,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testNormalRTTJitterStaysWithinNetworkDelayBudget() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         for index in 0..<8 {
             acknowledge(
@@ -318,7 +303,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testNetworkRecoveryRequiresDwellAndIsGradual() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         seedHealthy(controller, at: start)
         controller.noteServerQueue(bytes: 500_000, now: start.addingTimeInterval(1))
@@ -328,17 +313,23 @@ final class VideoTargetControllerTests: XCTestCase {
 
         controller.noteServerQueue(bytes: 0, now: start.addingTimeInterval(1.8))
         XCTAssertEqual(controller.targetFPS, reducedFPS)
+        for index in 0..<10 {
+            noteVideoDemand(controller, interval: 0.1,
+                now: start.addingTimeInterval(2.0 + Double(index) * 0.1))
+        }
         controller.noteServerQueue(bytes: 0, now: start.addingTimeInterval(3.0))
 
-        XCTAssertEqual(controller.targetFPS, reducedFPS)
+        let partiallyRecoveredFPS = controller.targetFPS
+        XCTAssertGreaterThan(partiallyRecoveredFPS, reducedFPS)
+        XCTAssertLessThan(partiallyRecoveredFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
         controller.noteServerQueue(bytes: 0, now: start.addingTimeInterval(4.2))
-        XCTAssertGreaterThan(controller.targetFPS, reducedFPS)
+        XCTAssertGreaterThan(controller.targetFPS, partiallyRecoveredFPS)
         XCTAssertLessThan(controller.targetFPS, 60)
     }
 
     func testEncodePressureUsesTimeDwellAndNeverReducesBitrate() {
-        let controller = VideoTargetController(
+        let controller = makeMeasuredVideoController(
             bitrate: 4_000_000,
             fps: 60,
             adaptationPriority: .fpsFirst
@@ -346,19 +337,49 @@ final class VideoTargetControllerTests: XCTestCase {
         let start = Date()
         for index in 0..<16 {
             let now = start.addingTimeInterval(Double(index) / 60)
-            controller.noteEncodedFrame(bytes: 60_000, fps: 60, encodeMs: 45, now: now)
-            controller.noteEncodePressure(now: now)
+            controller.noteEncodedFrame(bytes: 60_000, encodeMs: 90,
+                encodeBusyIntervalMs: 45, encoderBacklogged: true, now: now)
         }
         XCTAssertEqual(controller.targetFPS, 60)
 
-        controller.noteEncodePressure(now: start.addingTimeInterval(1.3))
+        controller.noteEncodedFrame(bytes: 60_000, encodeMs: 90,
+            encodeBusyIntervalMs: 45, encoderBacklogged: true,
+            now: start.addingTimeInterval(1.3))
 
         XCTAssertLessThan(controller.targetFPS, 60)
         XCTAssertEqual(controller.targetBitrate, 4_000_000)
     }
 
+    func testPipelineLatencyDoesNotLimitAchievedSixtyFPSThroughput() {
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
+        let start = Date()
+        for index in 0..<180 {
+            controller.noteEncodedFrame(bytes: 10_000, encodeMs: 32,
+                encodeBusyIntervalMs: 1_000 / 60, encoderBacklogged: true,
+                now: start.addingTimeInterval(Double(index) / 60))
+        }
+        XCTAssertEqual(controller.targetFPS, 60)
+        XCTAssertEqual(controller.performanceSnapshot().encoderPressure, 0)
+    }
+
+    func testApplicationLimitedEncoderDoesNotKeepAStaleCapacityCap() {
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
+        let start = Date()
+        for index in 0..<12 {
+            controller.noteEncodedFrame(bytes: 10_000, encodeMs: 80,
+                encodeBusyIntervalMs: 40, encoderBacklogged: true,
+                now: start.addingTimeInterval(Double(index) * 0.1))
+        }
+        XCTAssertLessThan(controller.targetFPS, 60)
+        for index in 0..<10 {
+            controller.noteEncodedFrame(bytes: 1_000, encodeMs: 30, encoderBacklogged: false,
+                now: start.addingTimeInterval(2 + Double(index) * 1.1))
+        }
+        XCTAssertEqual(controller.targetFPS, 60)
+    }
+
     func testEncoderFrameDropOnlyUpdatesTelemetry() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
 
         for _ in 0..<20 {
             controller.noteEncodeDrop()
@@ -369,7 +390,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testQoEIsDiagnosticAndDoesNotAdaptTargets() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let start = Date()
         controller.noteClientQoE(renderMs: 113, now: start)
         controller.noteClientQoE(renderMs: 113, now: start.addingTimeInterval(0.6))
@@ -380,7 +401,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testStallRecoveryStillRequiresRepeatedTimeouts() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
 
         XCTAssertFalse(controller.noteBackpressureTimeout(unackedWas: 3))
         XCTAssertFalse(controller.stallRecoveryMode)
@@ -391,7 +412,7 @@ final class VideoTargetControllerTests: XCTestCase {
     }
 
     func testSessionResetClearsSplitFeedback() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         controller.noteServerQueue(bytes: 100_000)
         acknowledge(controller, queue: .queued(bytes: 80_000), latency: 200)
         controller.resetSession()
@@ -401,11 +422,12 @@ final class VideoTargetControllerTests: XCTestCase {
         XCTAssertEqual(controller.lastServerQueueBytes, 0)
         XCTAssertEqual(controller.lastServerQueueDelayMs, 0)
         XCTAssertEqual(controller.targetFPS, 60)
-        XCTAssertEqual(controller.targetBitrate, 20_000_000)
+        XCTAssertEqual(controller.targetBitrate, VideoTargetController.initialAdaptiveBitrate)
+        XCTAssertEqual(controller.configuredBitrate, 20_000_000)
     }
 
     func testConcurrentFeedbackAndSnapshotsAreSafe() {
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         DispatchQueue.concurrentPerform(iterations: 1_000) { index in
             let queue: ClientQueueFeedback = index.isMultiple(of: 5)
                 ? .unavailable
@@ -435,7 +457,7 @@ final class VideoTargetControllerTests: XCTestCase {
         metrics.averageRTTMs = rttMs
         metrics.bandwidthKbps = bandwidthKbps
         metrics.rttMeasuredAtNanoseconds = 1
-        metrics.bandwidthMeasuredAtNanoseconds = 1
+        metrics.bandwidthMeasuredAtNanoseconds = 2
         controller.updateAutoDetect(metrics, now: now)
     }
 

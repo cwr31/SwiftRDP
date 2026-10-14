@@ -52,8 +52,4 @@ enum PrivilegedShell {
         return stdout
     }
 
-    /// Quote a path for safe inclusion in a shell script.
-    static func quote(_ path: String) -> String {
-        "'\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
-    }
 }

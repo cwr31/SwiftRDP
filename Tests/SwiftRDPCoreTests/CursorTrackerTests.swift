@@ -69,8 +69,8 @@ final class CursorTrackerTests: XCTestCase {
         XCTAssertEqual(updates.count, 1)
     }
 
-    func testSessionManagerStoresAppliedScale() {
-        let manager = SessionManager(config: ServerConfig(remotePointerScale: 1.0))
+    func testSessionManagerStoresAppliedScale() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig(remotePointerScale: 1.0))
 
         manager.applyRemotePointerScale(2.5)
 

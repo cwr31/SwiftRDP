@@ -4,7 +4,6 @@ import Foundation
 public enum FastPathOutput {
     public static let updatePtrNull: UInt8 = 0x5
     public static let updatePtrDefault: UInt8 = 0x6
-    public static let updatePtrPosition: UInt8 = 0x8
     public static let updateColor: UInt8 = 0x9
     public static let updateCached: UInt8 = 0xA
     public static let updatePointer: UInt8 = 0xB
@@ -48,13 +47,6 @@ public enum FastPathOutput {
         var p: [UInt8] = []
         p.appendU16(cacheIndex)
         return wrap([update(code: updateCached, payload: p)])
-    }
-
-    public static func pointerPosition(x: Int, y: Int) -> [UInt8] {
-        var p: [UInt8] = []
-        p.appendU16(UInt16(clamping: max(0, x)))
-        p.appendU16(UInt16(clamping: max(0, y)))
-        return wrap([update(code: updatePtrPosition, payload: p)])
     }
 
     public static func pointerDefault() -> [UInt8] {

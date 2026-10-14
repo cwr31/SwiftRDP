@@ -52,12 +52,9 @@ public struct ServerConfig: Sendable {
     public var displayMode: DisplayMode
     /// `IdleTimeout` — minutes of inactivity before disconnect (0 = off).
     public var idleTimeout: Int
-    /// H.264 encode bitrate ceiling (bps). The target controller lowers it under pressure.
-    public var videoBitrate: Int
+    public var videoQuality: VideoQualitySettings
     /// `TLSVersionMode`
     public var tlsVersionMode: TLSVersionMode
-    /// `AsyncEncoding` — encode off the capture thread when true.
-    public var asyncEncoding: Bool
     /// Stable physical display identity. Empty selects the current primary display.
     public var selectedDisplayIdentity: String
     public var hostDisplayPolicy: HostDisplayPolicy
@@ -86,9 +83,8 @@ public struct ServerConfig: Sendable {
         audioPlaybackDestination: AudioPlaybackDestination = .both,
         displayMode: DisplayMode = .h264,
         idleTimeout: Int = 0,
-        videoBitrate: Int = 20_000_000,
+        videoQuality: VideoQualitySettings = .default,
         tlsVersionMode: TLSVersionMode = .tls12,
-        asyncEncoding: Bool = true,
         selectedDisplayIdentity: String = "",
         hostDisplayPolicy: HostDisplayPolicy = .automatic,
         remotePointerScale: Double = 2.0,
@@ -111,9 +107,8 @@ public struct ServerConfig: Sendable {
         self.audioPlaybackDestination = audioPlaybackDestination
         self.displayMode = displayMode
         self.idleTimeout = idleTimeout
-        self.videoBitrate = Self.normalizedVideoBitrate(videoBitrate)
+        self.videoQuality = videoQuality
         self.tlsVersionMode = tlsVersionMode
-        self.asyncEncoding = asyncEncoding
         self.selectedDisplayIdentity = selectedDisplayIdentity
         self.hostDisplayPolicy = hostDisplayPolicy
         self.remotePointerScale = min(max(remotePointerScale, 1.0), 3.0)
@@ -129,10 +124,6 @@ public struct ServerConfig: Sendable {
 
     public var certsURL: URL {
         appSupportURL.appendingPathComponent("certs", isDirectory: true)
-    }
-
-    public var ntlmURL: URL {
-        appSupportURL.appendingPathComponent("ntlm", isDirectory: true)
     }
 
     public static let defaultVideoBitrate = 20_000_000

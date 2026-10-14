@@ -9,7 +9,8 @@ SwiftRDP 是一个使用 Swift 编写的原生 macOS RDP 服务端和屏幕共�
 - 支持 TLS，以及可选的 CredSSP/NLA 身份验证。
 - 使用 macOS 原生能力捕获屏幕，并注入远程键盘和鼠标输入。
 - 支持 Bitmap、H.264 和渐进式 RemoteFX 显示路径。
-- 自适应视频传输，可配置画质和帧率。
+- 自适应视频传输，可配置画质和帧率（[控制策略](docs/video-adaptation.md)）。
+- 支持可靠 UDP2 图形传输、TLS 认证和 Soft-Sync 切换，主连接继续使用 TCP。
 - 支持文本、图片和文件剪贴板同步。
 - 支持将系统音频转发到 RDP 客户端。
 - 支持选择物理显示器，以及可选的虚拟显示器模式。
@@ -68,17 +69,24 @@ bash scripts/install-and-run.sh
 3. 在 RDP 客户端中连接 Mac 的 IP 地址和 `3389` 端口。
 4. 使用 SwiftRDP 设置中显示的用户名和密码。
 
+服务器同时保留一个已认证的桌面会话。新连接通过认证并完成连接协商后才会接管，
+未认证或失败的连接不会打断当前桌面。
+
+支持 UDP2 的客户端会自动为 H.264/RemoteFX 图形协商多传输。TCP 和 UDP
+使用同一个 RDP 端口（默认 `3389`），切换完成后“连接”页显示 `TCP + UDP2`。
+UDP 无法建立时继续使用 TCP；切换后 UDP 失效时，会在 TCP 上重建图形通道。
+协议实现和验证方式见[多传输说明](docs/multitransport.md)。
+
 GUI 应用第一次启动时会生成随机密码。独立命令行目标使用开发环境默认值，因此
 在可信局域网之外使用前必须显式设置凭据。建议使用 VPN 或防火墙，不要直接把
 RDP 端口暴露到公网。
 
 ## 运行时数据
 
-SwiftRDP 会在仓库之外生成自签名 TLS 证书和身份验证缓存：
+SwiftRDP 会在仓库之外生成自签名 TLS 证书：
 
 ```text
 ~/Library/Application Support/SwiftRDP/certs/
-~/Library/Application Support/SwiftRDP/ntlm/
 ~/Library/Logs/SwiftRDP/
 ```
 

@@ -9,12 +9,14 @@ public enum GCC {
     public static let csMonitor: UInt16 = 0xC005
     public static let csMsgChannel: UInt16 = 0xC006
     public static let csMonitorEx: UInt16 = 0xC008
+    public static let csMultitransport: UInt16 = 0xC00A
 
     public static let scCore: UInt16 = 0x0C01
     public static let scSecurity: UInt16 = 0x0C02
     public static let scNet: UInt16 = 0x0C03
     /// TS_UD_SC_MCS_MSGCHANNEL (MS-RDPBCGR 2.2.1.4.5)
     public static let scMsgChannel: UInt16 = 0x0C04
+    public static let scMultitransport: UInt16 = 0x0C08
 
     /// RNS_UD_CS_SUPPORT_SKIP_CHANNELJOIN (MS-RDPBCGR 2.2.1.3.2) — NOT 0x0040 (monitor layout).
     public static let csSupportSkipChannelJoin: UInt16 = 0x0800
@@ -35,24 +37,13 @@ public enum GCC {
 
     /// Highest `TS_UD_SC_CORE.version` we implement (matches FreeRDP default `RDP_VERSION_10_12`).
     public static let rdpVersionMax: UInt32 = 0x0008_0011
-    /// Legacy RDP 5.0–8.1 server version (MS-RDPBCGR).
-    public static let rdpVersion5Plus: UInt32 = 0x0008_0004
+    /// Current clients can advertise the RDP 5+ CS_CORE marker.
+    public static let rdpVersionMin: UInt32 = 0x0008_0004
 
-    /// Negotiate SC_CORE version the FreeRDP way: `MIN(serverMax, clientVersion)`,
-    /// clamped to a known table entry (unknown client values fall back to `rdpVersion5Plus`).
-    public static func negotiateRdpVersion(clientVersion: UInt32) -> UInt32 {
-        let known: Set<UInt32> = [
-            0x0008_0001,
-            0x0008_0004,
-            0x0008_0005, 0x0008_0006, 0x0008_0007, 0x0008_0008,
-            0x0008_0009, 0x0008_000A, 0x0008_000B, 0x0008_000C,
-            0x0008_000D, 0x0008_000E, 0x0008_000F, 0x0008_0010,
-            0x0008_0011
-        ]
-        let capped = min(rdpVersionMax, clientVersion == 0 ? rdpVersionMax : clientVersion)
-        if known.contains(capped) { return capped }
-        // Client sent something odd — stay on the widely-supported 5+/8.x marker.
-        return min(rdpVersionMax, rdpVersion5Plus)
+    /// Accept defined CS_CORE versions without inventing a version for unknown input.
+    public static func negotiateRdpVersion(clientVersion: UInt32) -> UInt32? {
+        guard (rdpVersionMin...rdpVersionMax).contains(clientVersion) else { return nil }
+        return clientVersion
     }
 
     public struct ClientCore {
@@ -74,6 +65,7 @@ public enum GCC {
         public var net: ClientNet?
         /// CS_MCS_MSGCHANNEL present (logs `CS_MCS_MSGCHANNEL`).
         public var hasMsgChannel: Bool
+        public var multitransportFlags: UInt32 = 0
         public var clusterFlags: UInt32?
         public var rawBlocks: [(type: UInt16, data: [UInt8])]
         public var supportsSkipChannelJoin: Bool {
@@ -134,6 +126,8 @@ public enum GCC {
             case csMsgChannel:
                 result.hasMsgChannel = true
                 RDPLog.rdp.info("CS_MCS_MSGCHANNEL")
+            case csMultitransport:
+                if payload.count == 4 { result.multitransportFlags = u32(payload, 0) }
             default:
                 break
             }
@@ -216,15 +210,14 @@ public enum GCC {
         advertiseSkipChannelJoin: Bool = true,
         /// Must echo client's X.224 requestedProtocols (MS-RDPBCGR TS_UD_SC_CORE).
         clientRequestedProtocols: UInt32? = nil,
-        /// Client `TS_UD_CS_CORE.version` — SC_CORE advertises `MIN(rdpVersionMax, this)`.
-        clientRdpVersion: UInt32 = 0,
+        rdpVersion: UInt32 = rdpVersionMax,
         /// emit SC_MCS_MSGCHANNEL when client sent CS_MCS_MSGCHANNEL.
         advertiseMsgChannel: Bool = false,
-        msgChannelId: UInt16 = 1002
+        msgChannelId: UInt16 = 1002,
+        multitransportFlags: UInt32 = 0
     ) -> [UInt8] {
-        let negotiatedVersion = negotiateRdpVersion(clientVersion: clientRdpVersion)
         let scCore = buildSCCore(
-            rdpVersion: negotiatedVersion,
+            rdpVersion: rdpVersion,
             clientRequestedProtocols: clientRequestedProtocols ?? selectedProtocol,
             skipChannelJoin: advertiseSkipChannelJoin
         )
@@ -234,6 +227,11 @@ public enum GCC {
         if advertiseMsgChannel {
             serverBlocks += buildSCMsgChannel(channelId: msgChannelId)
             RDPLog.rdp.info("SC_MCS_MSGCHANNEL: channelId=\(msgChannelId)")
+        }
+        if multitransportFlags != 0 {
+            serverBlocks.appendU16(scMultitransport)
+            serverBlocks.appendU16(8)
+            serverBlocks.appendU32(multitransportFlags)
         }
 
         // GCC Conference Create Response — / wire layout.

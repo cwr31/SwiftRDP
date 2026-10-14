@@ -26,6 +26,11 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         let values: [SCStream]
     }
 
+    /// Native content snapshots expose read-only display/window descriptions.
+    private struct ShareableContentSnapshot: @unchecked Sendable {
+        let value: SCShareableContent
+    }
+
     private let lock = NSLock()
     private let captureQueue = DispatchQueue(label: "com.macrdp.capture", qos: .userInitiated)
     private var lifecycleGeneration: UInt64 = 0
@@ -41,16 +46,15 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
     private var configurationUpdateGeneration: UInt64 = 0
     private let displayLifecycle = DisplayCaptureLifecycle()
     private var firstSampleGeneration: UInt64?
+    private var startupSignal: CaptureResult<Void>?
     private var streamStartedAtNanoseconds: UInt64 = 0
     private var targetWidth: Int
     private var targetHeight: Int
     private var captureFPS = 30
     private var selectedDisplayIDValue: UInt32?
     private var activeDisplayIDValue: CGDirectDisplayID = 0
-    private var preferPixelBufferOnlyValue = false
+    private var contentLayoutValue: DisplayContentLayout?
     private var capturesAudioValue = false
-    /// Pixel format of the live SCStream (NV12 preferred, BGRA fallback).
-    private var activePixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     public var onFatalError: ((Error) -> Void)?
     public var onAudioPCM: (([Int16], Int, Int) -> Void)?
     /// Fired when the resolved capture display id changes (wake / resize / restart).
@@ -60,10 +64,10 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
     private var lastDisplayWakeRestartNs: UInt64 = 0
     /// Minimum interval between SCK restarts triggered by built-in panel sleep/wake.
     private static let displayWakeRestartMinIntervalNs: UInt64 = 8_000_000_000
-    /// Do not let one pixel format consume the RDP client's startup budget when
-    /// ScreenCaptureKit accepts the stream but never delivers a sample.
+    /// Bound startup even when ScreenCaptureKit starts without delivering a frame.
     private static let firstSampleTimeoutNs: UInt64 = 1_000_000_000
-    private static let firstSamplePollNs: UInt64 = 25_000_000
+    // SCStreamConfiguration.backgroundColor is an assign CF property, not retained.
+    private static let captureBackgroundColor = CGColor(gray: 0, alpha: 1)
 
     public init(width: Int = 0, height: Int = 0, frameHub: FrameHub = FrameHub()) {
         targetWidth = width
@@ -94,17 +98,8 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         return activeDisplayIDValue
     }
 
-    public var preferPixelBufferOnly: Bool {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return preferPixelBufferOnlyValue
-        }
-        set {
-            lock.lock()
-            preferPixelBufferOnlyValue = newValue
-            lock.unlock()
-        }
+    public var contentLayout: DisplayContentLayout? {
+        locked { contentLayoutValue }
     }
 
     public var capturesAudio: Bool {
@@ -198,7 +193,7 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
             await previous?.value
             guard !Task.isCancelled, let self,
                   self.locked({ self.activeStream === stream && self.wantsCapture }) else { return }
-            let configuration = self.liveConfiguration()
+            guard let configuration = self.liveConfiguration() else { return }
             do {
                 try await stream.updateConfiguration(configuration)
             } catch is CancellationError {
@@ -219,22 +214,19 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
     }
 
     /// Stream configuration for the current target geometry / FPS / audio state.
-    private func liveConfiguration() -> SCStreamConfiguration {
+    private func liveConfiguration() -> SCStreamConfiguration? {
         let snapshot = locked {
             (
-                width: targetWidth,
-                height: targetHeight,
+                layout: contentLayoutValue,
                 fps: captureFPS,
-                audio: capturesAudioValue,
-                pixelFormat: activePixelFormat
+                audio: capturesAudioValue
             )
         }
+        guard let layout = snapshot.layout else { return nil }
         return Self.makeStreamConfiguration(
-            width: snapshot.width,
-            height: snapshot.height,
+            layout: layout,
             fps: snapshot.fps,
-            capturesAudio: snapshot.audio,
-            pixelFormat: snapshot.pixelFormat
+            capturesAudio: snapshot.audio
         )
     }
 
@@ -323,7 +315,9 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
             pendingStream = nil
             pendingStreamGeneration = 0
             frameHub.clearLatestFrame()
+            contentLayoutValue = nil
             firstSampleGeneration = nil
+            startupSignal = nil
             let drain = Self.makeDrain(
                 previous: drainTask,
                 operation: operation,
@@ -368,7 +362,9 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         pendingStream = nil
         pendingStreamGeneration = 0
         frameHub.clearLatestFrame()
+        contentLayoutValue = nil
         firstSampleGeneration = nil
+        startupSignal = nil
         let drain = Self.makeDrain(
             previous: drainTask,
             operation: previousOperation,
@@ -476,147 +472,105 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
 
         let width = ticket.configuration.width > 0 ? ticket.configuration.width : display.width
         let height = ticket.configuration.height > 0 ? ticket.configuration.height : display.height
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let sourceWidth = Int(filter.contentRect.width)
+        let sourceHeight = Int(filter.contentRect.height)
+        guard sourceWidth > 0, sourceHeight > 0 else { throw CaptureError.noDisplay }
+        let layout = DisplayContentLayout.aspectFit(
+            desktopWidth: width,
+            desktopHeight: height,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight
+        )
         try updateResolvedDisplay(
             displayID: display.displayID,
-            width: width,
-            height: height,
+            layout: layout,
             generation: ticket.generation
         )
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let pixelFormats = [
-            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            kCVPixelFormatType_32BGRA,
-        ]
-        var started = false
-        var lastStartError: Error?
-        for pixelFormat in pixelFormats {
-            let config = Self.makeStreamConfiguration(
-                width: width,
-                height: height,
-                fps: ticket.configuration.fps,
-                capturesAudio: ticket.configuration.capturesAudio,
-                pixelFormat: pixelFormat
-            )
-            let stream = SCStream(filter: filter, configuration: config, delegate: self)
-            do {
-                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
-                guard installPending(stream, generation: ticket.generation) else {
-                    try? await stream.stopCapture()
-                    throw CancellationError()
-                }
-                try await stream.startCapture()
-                guard promotePending(stream, generation: ticket.generation) else {
-                    _ = takePending(stream, generation: ticket.generation)
-                    try? await stream.stopCapture()
-                    throw CancellationError()
-                }
-                locked { activePixelFormat = pixelFormat }
-                if pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-                    RDPLog.capture.info("ScreenCapturer: stream pixelFormat=NV12 full-range BT.709")
-                } else {
-                    RDPLog.capture.info("ScreenCapturer: stream pixelFormat=BGRA (NV12 unavailable)")
-                }
-                started = true
-                do {
-                    try await waitForFirstSample(generation: ticket.generation)
-                } catch {
-                    _ = takeActive(generation: ticket.generation)
-                    try? await stream.stopCapture()
-                    throw error
-                }
-                break
-            } catch is CancellationError {
+        let config = Self.makeStreamConfiguration(
+            layout: layout,
+            fps: ticket.configuration.fps,
+            capturesAudio: ticket.configuration.capturesAudio
+        )
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        let startup = CaptureResult<Void>()
+        do {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
+            guard installPending(stream, generation: ticket.generation, startup: startup) else {
                 throw CancellationError()
-            } catch {
-                lastStartError = error
-                _ = takePending(stream, generation: ticket.generation)
-                try? await stream.stopCapture()
-                RDPLog.capture.info(
-                    "ScreenCapturer: pixelFormat 0x\(String(pixelFormat, radix: 16)) " +
-                    "start failed (\(error.localizedDescription)); trying fallback"
-                )
             }
+            try await stream.startCapture()
+            guard promotePending(stream, generation: ticket.generation) else {
+                throw CancellationError()
+            }
+            try await startup.wait(
+                timeoutNanoseconds: Self.firstSampleTimeoutNs,
+                timeoutError: CaptureError.firstFrameTimedOut
+            )
+            try ensureCurrent(ticket.generation)
+            let ready = locked {
+                guard activeStream === stream, activeStreamGeneration == ticket.generation else { return false }
+                startupSignal = nil
+                return true
+            }
+            guard ready else { throw CaptureError.streamStoppedBeforeReady }
+        } catch {
+            discardStream(stream, generation: ticket.generation)
+            startup.fail(error)
+            try? await stream.stopCapture()
+            throw error
         }
-        guard started else {
-            throw lastStartError ?? CaptureError.noDisplay
-        }
-        try ensureCurrent(ticket.generation)
         RDPLog.capture.info(
             "ScreenCapturer: capturing display id=\(display.displayID) " +
-            "\(width)x\(height) @\(ticket.configuration.fps)fps"
+            "\(layout.desktopWidth)x\(layout.desktopHeight) @\(ticket.configuration.fps)fps " +
+            "NV12 full-range BT.709 content=\(layout.contentRect)"
         )
     }
 
-    /// `SCShareableContent` can hang indefinitely right after CGVirtualDisplay create/mirror.
-    /// Bound the wait and poll until the selected display appears (or fall back).
+    /// Retry bounded discovery of the explicitly selected display.
     private func shareableContentPreferring(
         displayID: UInt32?,
         generation: UInt64
     ) async throws -> SCShareableContent {
-        var lastError: Error?
-        // ~2s total: VirtualDisplay often takes a beat to show up in SCK.
+        let requestedID = displayID ?? CGMainDisplayID()
+        var lastError: Error = CaptureError.noDisplay
         for attempt in 1...4 {
             try ensureCurrent(generation)
             do {
                 let content = try await fetchShareableContent(timeoutNs: 800_000_000)
-                if let displayID,
-                   content.displays.contains(where: { $0.displayID == displayID }) {
-                    if attempt > 1 {
-                        RDPLog.capture.info(
-                            "ScreenCapturer: selected display id=\(displayID) ready after attempt \(attempt)"
-                        )
-                    }
+                if content.displays.contains(where: { $0.displayID == requestedID }) {
                     return content
                 }
-                if displayID == nil {
-                    return content
-                }
-                RDPLog.capture.info(
-                    "ScreenCapturer: display id=\(displayID!) not in SCK yet " +
-                    "(attempt \(attempt), displays=\(content.displays.map(\.displayID)))"
-                )
-                // Last attempt: return whatever we have so resolveDisplay can fall back.
-                if attempt == 4 { return content }
+                lastError = CaptureError.noDisplay
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 lastError = error
-                RDPLog.capture.error(
-                    "ScreenCapturer: SCShareableContent attempt \(attempt) failed: \(error)"
-                )
-                if attempt == 4 { throw error }
             }
-            try await Task.sleep(nanoseconds: 250_000_000)
+            RDPLog.capture.info("ScreenCapturer: display id=\(requestedID) unavailable (attempt \(attempt))")
+            if attempt < 4 { try await Task.sleep(nanoseconds: 250_000_000) }
         }
-        throw lastError ?? CaptureError.shareableContentTimedOut
+        throw lastError
     }
 
     private func fetchShareableContent(timeoutNs: UInt64) async throws -> SCShareableContent {
-        try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
-            group.addTask {
-                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let result = CaptureResult<ShareableContentSnapshot>()
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+            if let error {
+                result.fail(error)
+            } else if let content {
+                result.succeed(ShareableContentSnapshot(value: content))
+            } else {
+                result.fail(CaptureError.noDisplay)
             }
-            group.addTask {
-                try await Task.sleep(nanoseconds: timeoutNs)
-                throw CaptureError.shareableContentTimedOut
-            }
-            guard let content = try await group.next() else {
-                throw CaptureError.shareableContentTimedOut
-            }
-            group.cancelAll()
-            return content
         }
-    }
-
-    private func waitForFirstSample(generation: UInt64) async throws {
-        let deadline = DispatchTime.now().uptimeNanoseconds + Self.firstSampleTimeoutNs
-        while DispatchTime.now().uptimeNanoseconds < deadline {
-            try ensureCurrent(generation)
-            let received = locked { firstSampleGeneration == generation }
-            if received { return }
-            try await Task.sleep(nanoseconds: Self.firstSamplePollNs)
-        }
-        throw CaptureError.firstFrameTimedOut
+        let snapshot = try await result.wait(
+            timeoutNanoseconds: timeoutNs,
+            timeoutError: CaptureError.shareableContentTimedOut
+        )
+        return snapshot.value
     }
 
     private func cancelRecoveryLocked() {
@@ -625,18 +579,26 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
     }
 
     private func abortRunIfCurrent(_ generation: UInt64) async {
-        let drain: Task<Void, Never>? = locked { () -> Task<Void, Never>? in
+        let drain: Task<Void, Never>? = locked {
             guard lifecycleGeneration == generation else { return nil }
             lifecycleGeneration &+= 1
             wantsCapture = false
             cancelRecoveryLocked()
             displayLifecycle.stop()
+            configurationUpdateGeneration &+= 1
+            configurationUpdateTask?.cancel()
+            configurationUpdateTask = nil
             operationTask = nil
             let streams = Self.uniqueStreams([activeStream, pendingStream].compactMap { $0 })
             activeStream = nil
+            activeStreamGeneration = 0
             pendingStream = nil
+            pendingStreamGeneration = 0
             frameHub.clearLatestFrame()
+            contentLayoutValue = nil
             firstSampleGeneration = nil
+            startupSignal = nil
+            // The failing operation cannot await itself during teardown.
             let task = Self.makeDrain(previous: drainTask, operation: nil, streams: streams)
             drainTask = task
             return task
@@ -658,23 +620,31 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         if !current { throw CancellationError() }
     }
 
-    private func installPending(_ stream: SCStream, generation: UInt64) -> Bool {
+    private func installPending(_ stream: SCStream, generation: UInt64, startup: CaptureResult<Void>) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard wantsCapture, lifecycleGeneration == generation, pendingStream == nil else { return false }
         pendingStream = stream
         pendingStreamGeneration = generation
+        firstSampleGeneration = nil
+        startupSignal = startup
         streamStartedAtNanoseconds = DispatchTime.now().uptimeNanoseconds
         return true
     }
 
-    private func takePending(_ stream: SCStream, generation: UInt64) -> Bool {
+    private func discardStream(_ stream: SCStream, generation: UInt64) {
         lock.lock()
         defer { lock.unlock() }
-        guard pendingStream === stream, pendingStreamGeneration == generation else { return false }
-        pendingStream = nil
-        pendingStreamGeneration = 0
-        return true
+        if pendingStream === stream, pendingStreamGeneration == generation {
+            pendingStream = nil
+            pendingStreamGeneration = 0
+            startupSignal = nil
+        }
+        if activeStream === stream, activeStreamGeneration == generation {
+            activeStream = nil
+            activeStreamGeneration = 0
+            startupSignal = nil
+        }
     }
 
     private func promotePending(_ stream: SCStream, generation: UInt64) -> Bool {
@@ -689,29 +659,19 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         return true
     }
 
-    private func takeActive(generation: UInt64) -> SCStream? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard activeStreamGeneration == generation else { return nil }
-        let stream = activeStream
-        activeStream = nil
-        activeStreamGeneration = 0
-        return stream
-    }
-
     private func updateResolvedDisplay(
         displayID: CGDirectDisplayID,
-        width: Int,
-        height: Int,
+        layout: DisplayContentLayout,
         generation: UInt64
     ) throws {
         lock.lock()
         defer { lock.unlock() }
         guard wantsCapture, lifecycleGeneration == generation else { throw CancellationError() }
-        targetWidth = width
-        targetHeight = height
-        let changed = activeDisplayIDValue != displayID
+        targetWidth = layout.desktopWidth
+        targetHeight = layout.desktopHeight
+        let changed = activeDisplayIDValue != displayID || contentLayoutValue != layout
         activeDisplayIDValue = displayID
+        contentLayoutValue = layout
         selectedDisplayIDValue = UInt32(displayID)
         if changed {
             let handler = onCaptureDisplayChanged
@@ -725,40 +685,19 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         from content: SCShareableContent,
         selectedDisplayID: UInt32?
     ) -> SCDisplay? {
-        let awakeIDs = Set(DisplayTopology.physicalDisplayIDs().map(\.self))
-
-        if let selectedDisplayID,
-           let match = content.displays.first(where: { $0.displayID == selectedDisplayID }) {
-            if awakeIDs.isEmpty || awakeIDs.contains(selectedDisplayID) {
-                RDPLog.capture.info("ScreenCapturer: using selected display id=\(selectedDisplayID)")
-                return match
-            }
-            RDPLog.capture.info(
-                "ScreenCapturer: selected display id=\(selectedDisplayID) unavailable; picking awake display"
-            )
-        } else if let selectedDisplayID {
-            RDPLog.capture.info("ScreenCapturer: display id=\(selectedDisplayID) not found; using first display")
-        }
-
-        if !awakeIDs.isEmpty,
-           let awake = content.displays.first(where: { awakeIDs.contains($0.displayID) }) {
-            RDPLog.capture.info("ScreenCapturer: using awake display id=\(awake.displayID)")
-            return awake
-        }
-        return content.displays.first
+        let displayID = selectedDisplayID ?? CGMainDisplayID()
+        return content.displays.first { $0.displayID == displayID }
     }
 
-    static func isDisplaySleepError(_ error: Error) -> Bool {
-        let message = error.localizedDescription.lowercased()
-        if message.contains("找不到") {
-            return message.contains("显示器") || message.contains("窗口")
+    static func isCaptureSourceUnavailable(_ error: Error) -> Bool {
+        let error = error as NSError
+        guard error.domain == SCStreamErrorDomain else { return false }
+        switch SCStreamError.Code(rawValue: error.code) {
+        case .noWindowList, .noDisplayList, .noCaptureSource:
+            return true
+        default:
+            return false
         }
-        if message.contains("could not find") || message.contains("cannot find") {
-            return message.contains("display") || message.contains("window")
-        }
-        if message.contains("display") && message.contains("sleep") { return true }
-        if message.contains("no display") { return true }
-        return false
     }
 
     private func handleStreamStopped(_ stream: SCStream, error: Error) {
@@ -769,9 +708,15 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         }
         activeStream = nil
         activeStreamGeneration = 0
+        let startup = startupSignal
+        startupSignal = nil
+        let displayID = activeDisplayIDValue
         lock.unlock()
+        startup?.fail(error)
 
-        if Self.isDisplaySleepError(error) {
+        let sourceUnavailable = Self.isCaptureSourceUnavailable(error)
+            || (displayID != 0 && (CGDisplayIsOnline(displayID) == 0 || CGDisplayIsAsleep(displayID) != 0))
+        if sourceUnavailable {
             RDPLog.capture.info(
                 "ScreenCapturer: stream stopped (display unavailable): \(error.localizedDescription)"
             )
@@ -781,7 +726,7 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         if capturesAwakePhysicalPanel {
             DisplayWake.wakeIfNeeded()
         }
-        let delayNs: UInt64 = Self.isDisplaySleepError(error) ? 1_500_000_000 : 200_000_000
+        let delayNs: UInt64 = sourceUnavailable ? 1_500_000_000 : 200_000_000
         scheduleRecovery(reason: "stream stopped", delayNs: delayNs)
     }
 
@@ -857,20 +802,20 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
         return result
     }
 
-    private static func makeStreamConfiguration(
-        width: Int,
-        height: Int,
+    static func makeStreamConfiguration(
+        layout: DisplayContentLayout,
         fps: Int,
-        capturesAudio: Bool,
-        pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        capturesAudio: Bool
     ) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        config.width = width
-        config.height = height
-        // Scale panel → configured size in SCKit (GPU) when sizes differ.
+        config.width = layout.desktopWidth
+        config.height = layout.desktopHeight
+        config.destinationRect = layout.contentRect
         config.scalesToFit = true
+        config.preservesAspectRatio = true
+        config.backgroundColor = Self.captureBackgroundColor
         // MS-RDPEGFX AVC uses full-range BT.709. Keep capture and H.264 VUI aligned.
-        config.pixelFormat = pixelFormat
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
         config.colorSpaceName = CGColorSpace.itur_709
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(fps, 1)))
@@ -889,6 +834,7 @@ public final class ScreenCapturer: NSObject, @unchecked Sendable {
     public enum CaptureError: Error {
         case noDisplay
         case firstFrameTimedOut
+        case streamStoppedBeforeReady
         case shareableContentTimedOut
     }
 }
@@ -923,65 +869,15 @@ extension ScreenCapturer: SCStreamDelegate, SCStreamOutput {
         } else {
             generation = nil
         }
-        let pixelBufferOnly = preferPixelBufferOnlyValue
         lock.unlock()
         guard let generation else { return }
 
         let dirtyRects = Self.extractDirtyRects(from: sampleBuffer)
-        if pixelBufferOnly {
-            let frame = CapturedFrame(
-                width: CVPixelBufferGetWidth(pixelBuffer),
-                height: CVPixelBufferGetHeight(pixelBuffer),
-                bgrBottomUp: [],
-                dirtyRects: dirtyRects,
-                pixelBuffer: pixelBuffer,
-                captureUptimeNanoseconds: captureUptimeNanoseconds
-            )
-            commit(frame: frame, from: stream, generation: generation)
-            return
-        }
-
-        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        guard format == kCVPixelFormatType_32BGRA else {
-            // NV12 / other: keep the pixel buffer for GFX; bitmap path needs BGRA.
-            let frame = CapturedFrame(
-                width: CVPixelBufferGetWidth(pixelBuffer),
-                height: CVPixelBufferGetHeight(pixelBuffer),
-                bgrBottomUp: [],
-                dirtyRects: dirtyRects,
-                pixelBuffer: pixelBuffer,
-                captureUptimeNanoseconds: captureUptimeNanoseconds
-            )
-            commit(frame: frame, from: stream, generation: generation)
-            return
-        }
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
-        let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let source = base.assumingMemoryBound(to: UInt8.self)
-        let rowSize = (width * 3 + 3) & ~3
-        var bgr = [UInt8](repeating: 0, count: rowSize * height)
-        for y in 0..<height {
-            let sourceRow = source.advanced(by: y * stride)
-            let destinationRow = (height - 1 - y) * rowSize
-            for x in 0..<width {
-                let sourceIndex = x * 4
-                let destinationIndex = destinationRow + x * 3
-                bgr[destinationIndex] = sourceRow[sourceIndex]
-                bgr[destinationIndex + 1] = sourceRow[sourceIndex + 1]
-                bgr[destinationIndex + 2] = sourceRow[sourceIndex + 2]
-            }
-        }
-
         commit(
             frame: CapturedFrame(
-                width: width,
-                height: height,
-                bgrBottomUp: bgr,
+                width: CVPixelBufferGetWidth(pixelBuffer),
+                height: CVPixelBufferGetHeight(pixelBuffer),
+                bgrBottomUp: [],
                 dirtyRects: dirtyRects,
                 pixelBuffer: pixelBuffer,
                 captureUptimeNanoseconds: captureUptimeNanoseconds
@@ -993,6 +889,7 @@ extension ScreenCapturer: SCStreamDelegate, SCStreamOutput {
 
     private func commit(frame: CapturedFrame, from stream: SCStream, generation: UInt64) {
         let firstSampleDelayMs: Double?
+        let startup: CaptureResult<Void>?
         lock.lock()
         let isCurrent = wantsCapture && lifecycleGeneration == generation && (
             (activeStream === stream && activeStreamGeneration == generation) ||
@@ -1004,15 +901,18 @@ extension ScreenCapturer: SCStreamDelegate, SCStreamOutput {
         }
         if firstSampleGeneration != generation {
             firstSampleGeneration = generation
+            startup = startupSignal
             let now = DispatchTime.now().uptimeNanoseconds
             let elapsed = now >= streamStartedAtNanoseconds ? now - streamStartedAtNanoseconds : 0
             firstSampleDelayMs = Double(elapsed) / 1_000_000
         } else {
             firstSampleDelayMs = nil
+            startup = nil
         }
         frameHub.publish(frame, notify: false)
         lock.unlock()
 
+        startup?.succeed(())
         if let firstSampleDelayMs {
             RDPLog.capture.info(
                 String(

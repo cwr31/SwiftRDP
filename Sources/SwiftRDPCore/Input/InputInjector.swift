@@ -1,5 +1,4 @@
 import Foundation
-import CoreGraphics
 
 /// Thin facade over MouseHandler + KeyboardHandler (split) for PDU parsing.
 public final class InputInjector: @unchecked Sendable {
@@ -10,24 +9,9 @@ public final class InputInjector: @unchecked Sendable {
     /// Fired on mouse/keyboard input (for IdleTimeout — not every TCP byte).
     public var onUserActivity: (() -> Void)?
 
-    public var scaleX: CGFloat {
-        get { mouse.scaleX }
-        set { mouse.scaleX = newValue }
-    }
-
-    public var scaleY: CGFloat {
-        get { mouse.scaleY }
-        set { mouse.scaleY = newValue }
-    }
-
-    public var originX: CGFloat {
-        get { mouse.originX }
-        set { mouse.originX = newValue }
-    }
-
-    public var originY: CGFloat {
-        get { mouse.originY }
-        set { mouse.originY = newValue }
+    public func setDesktopMapping(_ mapping: DesktopInputMapping?) {
+        mouse.coordinateMapping = mapping
+        touch.coordinateMapping = mapping
     }
 
     public init(

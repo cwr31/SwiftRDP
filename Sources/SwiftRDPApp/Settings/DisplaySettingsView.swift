@@ -30,13 +30,6 @@ struct DisplaySettingsView: View {
         )
     }
 
-    private var videoQualityBinding: Binding<VideoQualityPreset> {
-        Binding(
-            get: { VideoQualityPreset(rawValue: prefs.videoBitrate) ?? .default },
-            set: { prefs.videoBitrate = $0.rawValue }
-        )
-    }
-
     private var videoFPSBinding: Binding<VideoFPSPreset> {
         Binding(
             get: { VideoFPSPreset(rawValue: prefs.videoFPS) ?? .default },
@@ -45,7 +38,7 @@ struct DisplaySettingsView: View {
     }
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section {
                 LabeledContent(L10n.t(.displayMode)) {
                     Picker("", selection: $prefs.displayMode) {
@@ -55,46 +48,46 @@ struct DisplaySettingsView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
+                    .frame(width: 260)
+                    .accessibilityLabel(L10n.t(.displayMode))
                 }
                 .onChange(of: prefs.displayMode) { _, _ in onRestartNeeded() }
             }
 
             if prefs.displayMode == .h264 {
-                Section(L10n.t(.sectionH264)) {
-                    Picker(L10n.t(.videoQuality), selection: videoQualityBinding) {
-                            ForEach(VideoQualityPreset.allCases) { preset in
-                                Text(preset.title).tag(preset)
-                            }
-                        }
+                Section {
+                    VideoQualityPicker(selection: $prefs.videoQuality)
 
-                    Text(L10n.t(.videoQualityHelp))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Picker(L10n.t(.videoFPS), selection: videoFPSBinding) {
-                            ForEach(VideoFPSPreset.allCases) { preset in
-                                Text(preset.title).tag(preset)
-                            }
+                    Picker(selection: videoFPSBinding) {
+                        ForEach(VideoFPSPreset.allCases.reversed()) { preset in
+                            Text(preset.title).tag(preset)
                         }
+                    } label: {
+                        SettingsControlLabel(.videoFPS, detail: .videoFPSHelp)
+                    }
+                    .accessibilityLabel(L10n.t(.videoFPS))
 
                     Picker(L10n.t(.videoAdaptationPriority), selection: $prefs.videoAdaptationPriority) {
-                            ForEach(VideoAdaptationPriority.allCases) { priority in
-                                Text(priority.title).tag(priority)
-                            }
+                        ForEach(VideoAdaptationPriority.allCases) { priority in
+                            Text(priority.title).tag(priority)
                         }
+                    }
+                } header: {
+                    Text(L10n.t(.sectionVideo))
+                } footer: {
+                    SettingsHelpText(.defaultVideoSettingsHelp)
                 }
             } else {
                 Section {
                     Picker(L10n.t(.videoFPS), selection: videoFPSBinding) {
-                            ForEach(VideoFPSPreset.allCases) { preset in
-                                Text(preset.title).tag(preset)
-                            }
+                        ForEach(VideoFPSPreset.allCases.reversed()) { preset in
+                            Text(preset.title).tag(preset)
                         }
+                    }
                 }
             }
 
-            Section(L10n.t(.monitors)) {
+            Section {
                 Picker(L10n.t(.displaySource), selection: $prefs.hostDisplayPolicy) {
                     ForEach(HostDisplayPolicy.allCases, id: \.self) { policy in
                         Text(hostDisplayPolicyTitle(policy)).tag(policy)
@@ -111,13 +104,12 @@ struct DisplaySettingsView: View {
                     .onChange(of: prefs.selectedDisplayIdentity) { _, _ in onRestartNeeded() }
                 }
 
-                Text(L10n.t(.hostDisplayPolicyHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                Text(L10n.t(.monitors))
+            } footer: {
+                SettingsHelpText(.hostDisplayPolicyHelp)
             }
         }
-        .formStyle(.grouped)
     }
 
     private func hostDisplayPolicyTitle(_ policy: HostDisplayPolicy) -> String {

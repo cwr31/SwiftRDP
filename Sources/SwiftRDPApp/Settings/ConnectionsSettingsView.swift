@@ -11,7 +11,7 @@ struct ConnectionsSettingsView: View {
     private var audit: ConnectionAudit { prefs.connectionAudit }
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section(L10n.t(.connectionStatus)) {
                 if let live {
                     LiveConnectionRow(client: live, prefs: prefs) {
@@ -24,19 +24,12 @@ struct ConnectionsSettingsView: View {
             }
 
             Section(L10n.t(.accessControl)) {
-                Toggle(L10n.t(.knownPeersOnly), isOn: $prefs.knownPeersOnly)
-                Text(L10n.t(.knownPeersOnlyHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $prefs.knownPeersOnly) {
+                    SettingsControlLabel(.knownPeersOnly, detail: .knownPeersOnlyHelp)
+                }
             }
 
-            Section(L10n.t(.rememberedConnections)) {
-                Text(L10n.t(.rememberedConnectionsHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
+            Section {
                 if prefs.rememberedSessionSettings.isEmpty {
                     Label(L10n.t(.noRememberedConnections), systemImage: "externaldrive")
                         .foregroundStyle(.secondary)
@@ -45,20 +38,13 @@ struct ConnectionsSettingsView: View {
                         RememberedConnectionRow(settings: settings, prefs: prefs)
                     }
                 }
+            } header: {
+                Text(L10n.t(.rememberedConnections))
+            } footer: {
+                SettingsHelpText(.rememberedConnectionsHelp)
             }
 
             Section {
-                HStack {
-                    Text(L10n.t(.connectionsHistory))
-                    Spacer()
-                    Button(L10n.t(.clearHistory), systemImage: "trash", role: .destructive) {
-                        audit.clearHistory()
-                        refresh()
-                    }
-                    .controlSize(.small)
-                    .disabled(history.isEmpty)
-                }
-
                 if history.isEmpty {
                     Label(L10n.t(.connectionsHistoryEmpty), systemImage: "clock")
                         .foregroundStyle(.secondary)
@@ -72,9 +58,20 @@ struct ConnectionsSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+            } header: {
+                HStack {
+                    Text(L10n.t(.connectionsHistory))
+                    Spacer()
+                    Button(L10n.t(.clearHistory), systemImage: "trash", role: .destructive) {
+                        audit.clearHistory()
+                        refresh()
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    .disabled(history.isEmpty)
+                }
             }
         }
-        .formStyle(.grouped)
         .onAppear(perform: refresh)
         .onReceive(Self.refreshTick) { _ in refresh() }
     }
@@ -116,6 +113,7 @@ private struct LiveConnectionRow: View {
             }
 
             HStack(spacing: 10) {
+                Text(client.transportLabel)
                 if !client.securityLabel.isEmpty {
                     Text(client.securityLabel)
                         .font(.caption2)
@@ -263,23 +261,21 @@ private struct RememberedConnectionRow: View {
 
     var body: some View {
         DisclosureGroup {
-                Picker(L10n.t(.videoQuality), selection: bitrateBinding) {
-                    ForEach(VideoQualityPreset.allCases) { preset in
-                        Text(preset.title).tag(preset.rawValue)
-                    }
-                }
+            if prefs.displayMode == .h264 {
+                VideoQualityPicker(selection: qualityBinding)
+            }
 
             Picker(L10n.t(.videoFPS), selection: fpsBinding) {
-                    ForEach(VideoFPSPreset.allCases) { preset in
-                        Text(preset.title).tag(preset.rawValue)
-                    }
+                ForEach(VideoFPSPreset.allCases.reversed()) { preset in
+                    Text(preset.title).tag(preset.rawValue)
                 }
+            }
 
             Picker(L10n.t(.audioPlaybackDestination), selection: audioBinding) {
-                    ForEach(AudioPlaybackDestination.allCases) { destination in
-                        Text(audioDestinationTitle(destination)).tag(destination)
-                    }
+                ForEach(AudioPlaybackDestination.allCases) { destination in
+                    Text(audioDestinationTitle(destination)).tag(destination)
                 }
+            }
 
             LabeledContent(L10n.t(.resolutionMenu)) {
                 HStack(spacing: 8) {
@@ -296,6 +292,7 @@ private struct RememberedConnectionRow: View {
                             Image(systemName: "arrow.counterclockwise")
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityLabel(L10n.t(.followClientResolution))
                         .help(L10n.t(.followClientResolution))
                     }
                 }
@@ -327,14 +324,10 @@ private struct RememberedConnectionRow: View {
         }
     }
 
-    private var bitrateBinding: Binding<Int> {
+    private var qualityBinding: Binding<VideoQualitySettings> {
         Binding(
-            get: { settings.videoBitrate },
-            set: { value in
-                var updated = settings
-                updated.videoBitrate = value
-                prefs.updateRememberedSessionSettings(updated)
-            }
+            get: { prefs.videoQuality(for: settings.id) ?? settings.videoQuality },
+            set: { prefs.updateVideoQuality($0, for: settings.id) }
         )
     }
 

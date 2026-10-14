@@ -4,70 +4,46 @@ struct InputSettingsView: View {
     @ObservedObject var prefs: AppPreferences
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section(L10n.t(.mouseWheel)) {
-                LabeledContent(L10n.t(.scrollSpeed)) {
-                    VStack(alignment: .trailing, spacing: 8) {
-                        Text(scrollSpeedLabel)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                        Slider(value: $prefs.wheelScrollSpeed, in: 0.25...3.0, step: 0.25)
-                        HStack {
-                            Text("0.25×")
-                            Spacer()
-                            Text("3×")
-                        }
-                        .frame(maxWidth: .infinity)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    }
+                SettingsSliderRow(
+                    title: .scrollSpeed,
+                    value: scrollSpeedLabel,
+                    lowerBound: "0.25×",
+                    upperBound: "3×",
+                    detail: .scrollSpeedHelp
+                ) {
+                    Slider(value: $prefs.wheelScrollSpeed, in: 0.25...3.0, step: 0.25)
                 }
-                
-                Text(L10n.t(.scrollSpeedHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+
                 Toggle(L10n.t(.invertScroll), isOn: $prefs.invertWheelScroll)
             }
 
             Section(L10n.t(.remotePointer)) {
-                LabeledContent(L10n.t(.remotePointerSize)) {
-                    VStack(alignment: .trailing, spacing: 8) {
-                        Text(pointerScaleLabel)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                        Slider(
-                            value: $prefs.remotePointerScale,
-                            in: 1.0...3.0,
-                            step: 0.25,
-                            onEditingChanged: { editing in
-                                if !editing {
-                                    prefs.applyRemotePointerScale()
-                                }
+                SettingsSliderRow(
+                    title: .remotePointerSize,
+                    value: pointerScaleLabel,
+                    lowerBound: "1×",
+                    upperBound: "3×",
+                    detail: .remotePointerSizeHelp
+                ) {
+                    Slider(
+                        value: $prefs.remotePointerScale,
+                        in: 1.0...3.0,
+                        step: 0.25,
+                        onEditingChanged: { editing in
+                            if !editing {
+                                prefs.applyRemotePointerScale()
                             }
-                        )
-                        HStack {
-                            Text("1×")
-                            Spacer()
-                            Text("3×")
                         }
-                        .frame(maxWidth: .infinity)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    }
+                    )
                 }
-                
-                Text(L10n.t(.remotePointerSizeHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Section(L10n.t(.keyboardMapping)) {
                 KeyboardBindingEditor(prefs: prefs)
             }
         }
-        .formStyle(.grouped)
     }
 
     private var scrollSpeedLabel: String {

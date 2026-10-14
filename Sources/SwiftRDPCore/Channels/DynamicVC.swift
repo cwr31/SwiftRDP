@@ -14,11 +14,7 @@ public final class DynamicVCManager {
         case caps = 0x05
         case dataFirstCompressed = 0x06
         case dataCompressed = 0x07
-    }
-
-    public enum CreateStatus: UInt32 {
-        case success = 0
-        case invalidChannel = 1
+        case softSyncResponse = 0x09
     }
 
     public struct Channel {
@@ -32,6 +28,14 @@ public final class DynamicVCManager {
     public var send: (([UInt8]) -> Void)?
     /// Batched outbound DVC PDUs, used to enqueue one complete video frame atomically.
     public var sendBatch: (([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)?
+    private var multitransportSender: (([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)?
+    var sendMultitransportBatch: (([[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)? {
+        get { sendLock.withLock { multitransportSender } }
+        set { sendLock.withLock { multitransportSender = newValue } }
+    }
+    var onSoftSyncResponse: (([UInt32]) -> Void)?
+    /// Protected by sendLock so a complete frame belongs to exactly one transport.
+    private var multitransportChannel: UInt32?
 
     private var nextChannelId: UInt32 = 1
     private var channelsById: [UInt32: Channel] = [:]
@@ -39,18 +43,18 @@ public final class DynamicVCManager {
     private var createHandlers: [String: (UInt32, @escaping ([UInt8]) -> Void) -> Void] = [:]
     private var capsExchanged = false
     /// Set when server sends DYNVC_CAPS_VERSION3.
-    private var capsSentAt: Date?
+    private var capsSent = false
     /// Server-initiated creates awaiting client CREATE_RSP (MS-RDPEDYC: server sends CREATE_REQ).
     private var pendingCreateById: [UInt32: String] = [:]
     private var fragmentBuffers: [UInt32: (total: UInt32, data: [UInt8], started: Date)] = [:]
-    /// C→S RDP8 bulk history is independent of the outbound Graphics compressor.
-    private let inboundZGFX = ZGFXCompressor()
+    /// MS-RDPEDYC 3.1.5: each DVC owns its decompression history across a transport switch.
+    private var inboundDecoders: [UInt32: ZGFXCompressor] = [:]
     private let maxFragmentBytes = 16 * 1024 * 1024
     private var corruptionCount = 0
     private let maxPendingCreates = 32
     private let maxPendingFragments = 64
-    /// Static virtual-channel implementations conventionally use 1600-byte DVC PDUs.
-    private static let maxTCPDataChunkBytes = 1600
+    /// MS-RDPEDYC 3.1.5 limits DVC PDUs to 1600 bytes on reliable transports.
+    private static let maxDataPDUBytes = 1600
     /// Serializes complete logical DVC writes.
     private let sendLock = NSLock()
     /// CAPS response timeout: 10s.
@@ -61,11 +65,6 @@ public final class DynamicVCManager {
     public init() {}
 
     public var hasCompletedCapsExchange: Bool { capsExchanged }
-
-    public var hasCapsResponseTimedOut: Bool {
-        guard !capsExchanged, let sent = capsSentAt else { return false }
-        return Date().timeIntervalSince(sent) >= 10.0
-    }
 
     // MARK: - Header
 
@@ -131,6 +130,7 @@ public final class DynamicVCManager {
     /// Clears local maps then notifies the close handler (same as client CLOSE).
     public func closeChannel(name: String) {
         guard let channelId = channelsByName[name] else { return }
+        resetMultitransport(channelId: channelId)
         let cbId = Self.widthCode(for: channelId)
         if let send {
             send(buildClose(channelId: channelId, cbChannelId: cbId))
@@ -139,6 +139,7 @@ public final class DynamicVCManager {
         channelsById.removeValue(forKey: channelId)
         channelsByName.removeValue(forKey: name)
         fragmentBuffers.removeValue(forKey: channelId)
+        inboundDecoders.removeValue(forKey: channelId)
         dataHandlers.removeValue(forKey: channelId)
         if let close = closeHandlers.removeValue(forKey: channelId) {
             close()
@@ -148,6 +149,7 @@ public final class DynamicVCManager {
     // MARK: - Inbound
 
     public func handle(pdu: [UInt8]) {
+        expireFragments(now: Date())
         guard !pdu.isEmpty else {
             RDPLog.channels.debug("DRDYNVC: PDU too short (\(pdu.count)B)")
             return
@@ -158,6 +160,19 @@ public final class DynamicVCManager {
             handleOne(pdu: pdu, offset: &offset)
             if offset <= start { break }
         }
+    }
+
+    /// The client's Soft-Sync response approves tunnels, not individual inbound DVCs.
+    /// Accept data for any open DVC; its compression history stays with the channel.
+    func handleMultitransport(pdu: [UInt8]) -> Bool {
+        guard let byte = pdu.first else { return false }
+        let header = Self.parseHeader(byte)
+        guard [2, 3, 4, 6, 7].contains(header.cmd) else { return false }
+        var offset = 1
+        guard let channelId = readChannelId(pdu, offset: &offset, cbChId: header.cbId),
+              channelsById[channelId] != nil || dataHandlers[channelId] != nil || dataRelay != nil else { return false }
+        handle(pdu: pdu)
+        return true
     }
 
     private func handleOne(pdu: [UInt8], offset: inout Int) {
@@ -200,22 +215,20 @@ public final class DynamicVCManager {
         case .dataCompressed:
             handleCompressedData(pdu: pdu, cbChId: parsed.cbId, offset: &offset)
             offset = pdu.count
+        case .softSyncResponse:
+            if let tunnels = MultitransportPDU.softSyncResponse(Array(pdu[(offset - 1)...])) {
+                onSoftSyncResponse?(tunnels)
+            }
+            offset = pdu.count
         }
     }
 
-    /// expire stale fragments / pending creates (~10s).
-    public func sweepStaleState(now: Date = Date()) {
+    /// Bound fragment retention on inbound activity without a polling task.
+    private func expireFragments(now: Date) {
         let timeout: TimeInterval = 10
         for (id, frag) in fragmentBuffers where now.timeIntervalSince(frag.started) > timeout {
             fragmentBuffers.removeValue(forKey: id)
             RDPLog.channels.info("DVC: fragment timeout channelId=\(id)")
-        }
-        // pendingCreateById has no timestamp — drop if CAPS timed out heavily.
-        if hasCapsResponseTimedOut, !pendingCreateById.isEmpty {
-            for id in pendingCreateById.keys {
-                RDPLog.channels.info("DVC: pendingCreate timeout channelId=\(id)")
-            }
-            pendingCreateById.removeAll()
         }
     }
 
@@ -227,12 +240,12 @@ public final class DynamicVCManager {
         }
         let version = UInt16(pdu[offset]) | UInt16(pdu[offset + 1]) << 8
         offset += 2
-        inboundZGFX.reset()
+        inboundDecoders.removeAll()
         RDPLog.channels.debug("DRDYNVC: CAPS version=\(version)")
 
         let firstExchange = !capsExchanged
         let negotiatedVersion: UInt16
-        if capsSentAt != nil, !capsExchanged {
+        if capsSent, !capsExchanged {
             capsExchanged = true
             negotiatedVersion = version
         } else if capsExchanged {
@@ -240,7 +253,7 @@ public final class DynamicVCManager {
         } else {
             // Client initiated CAPS — reply with the negotiated version.
             capsExchanged = true
-            capsSentAt = capsSentAt ?? Date()
+            capsSent = true
             let rspVersion = min(max(version, 1), 3)
             negotiatedVersion = rspVersion
             send?(buildCapsResponse(version: rspVersion))
@@ -255,13 +268,13 @@ public final class DynamicVCManager {
 
     /// Server-first DYNVC_CAPS_VERSION3 once `onSend` is live.
     public func sendServerCapsIfNeeded() {
-        guard capsSentAt == nil, !capsExchanged else { return }
+        guard !capsSent, !capsExchanged else { return }
         guard let send else {
             RDPLog.channels.debug("DVC: CAPS_VERSION3 deferred (send not wired)")
             return
         }
         send(buildCapsVersion3())
-        capsSentAt = Date()
+        capsSent = true
         RDPLog.channels.info("DVC: sent CAPS_VERSION3")
     }
 
@@ -283,7 +296,7 @@ public final class DynamicVCManager {
         }
 
         RDPLog.channels.info("DVC: CREATE_RSP channelId=\(channelId)")
-        if status != CreateStatus.success.rawValue {
+        if status != 0 {
             let err = "status=0x\(String(status, radix: 16))"
             if name == Self.graphicsDVCName {
                 RDPLog.channels.error("GFX: channel create failed: \(err)")
@@ -325,7 +338,7 @@ public final class DynamicVCManager {
     ) {
         guard let channelId = readChannelId(pdu, offset: &offset, cbChId: cbChId),
               let totalLen = readVariableUInt32(pdu, offset: &offset, widthCode: sp),
-              let chunk = decompressBulkPayload(Array(pdu[offset...]), command: "DATA_FIRST") else {
+              let chunk = decompressBulkPayload(Array(pdu[offset...]), channelId: channelId, command: "DATA_FIRST") else {
             return
         }
         acceptFirstChunk(channelId: channelId, totalLen: totalLen, chunk: chunk)
@@ -356,14 +369,22 @@ public final class DynamicVCManager {
         pdu: [UInt8], cbChId: UInt8, offset: inout Int
     ) {
         guard let channelId = readChannelId(pdu, offset: &offset, cbChId: cbChId),
-              let chunk = decompressBulkPayload(Array(pdu[offset...]), command: "DATA") else {
+              let chunk = decompressBulkPayload(Array(pdu[offset...]), channelId: channelId, command: "DATA") else {
             return
         }
         acceptChunk(channelId: channelId, chunk: chunk)
     }
 
-    private func decompressBulkPayload(_ payload: [UInt8], command: String) -> [UInt8]? {
-        guard let decoded = inboundZGFX.decompressSegment(payload) else {
+    private func decompressBulkPayload(_ payload: [UInt8], channelId: UInt32, command: String) -> [UInt8]? {
+        guard channelsById[channelId] != nil || dataHandlers[channelId] != nil || dataRelay != nil else { return nil }
+        let decoder: ZGFXCompressor
+        if let existing = inboundDecoders[channelId] { decoder = existing }
+        else {
+            guard inboundDecoders.count < maxPendingFragments else { return nil }
+            decoder = ZGFXCompressor()
+            inboundDecoders[channelId] = decoder
+        }
+        guard let decoded = decoder.decompressSegment(payload) else {
             RDPLog.channels.error("DRDYNVC: failed to decompress \(command) RDP8 bulk segment")
             return nil
         }
@@ -391,6 +412,8 @@ public final class DynamicVCManager {
 
     private func handleClose(pdu: [UInt8], cbChId: UInt8, offset: inout Int) {
         guard let channelId = readChannelId(pdu, offset: &offset, cbChId: cbChId) else { return }
+        resetMultitransport(channelId: channelId)
+        inboundDecoders.removeValue(forKey: channelId)
         if let ch = channelsById.removeValue(forKey: channelId) {
             channelsByName.removeValue(forKey: ch.name)
             RDPLog.channels.info("DVC: CLOSE channelId=\(channelId) name=\(ch.name)")
@@ -422,50 +445,28 @@ public final class DynamicVCManager {
         closeHandlers[channelId] = handler
     }
 
-    public func clearDataHandler(channelId: UInt32) {
-        dataHandlers.removeValue(forKey: channelId)
-        closeHandlers.removeValue(forKey: channelId)
-    }
-
     // MARK: - Outbound builders
 
-    public func buildCapsResponse(version: UInt16 = 1, priorityCharge: UInt16 = 0) -> [UInt8] {
+    private func buildCapsResponse(version: UInt16) -> [UInt8] {
         // CAPS_RSP: UINT16 0x0050 (= header 0x50 + pad 0x00), then version.
         var pdu: [UInt8] = []
         pdu.append(Self.header(cmd: .caps, sp: 0, cbId: 0)) // 0x50
         pdu.append(0)
         pdu.appendU16(version)
-        _ = priorityCharge
         return pdu
     }
 
     /// DYNVC_CAPS_VERSION3 (MS-RDPEDYC 2.2.1.1.3).
     public func buildCapsVersion3() -> [UInt8] {
-        buildCapsVersion(version: 3, sp: 0)
-    }
-
-    private func buildCapsVersion(version: UInt16, sp: UInt8) -> [UInt8] {
         var pdu: [UInt8] = []
-        pdu.append(Self.header(cmd: .caps, sp: sp, cbId: 0))
+        pdu.append(Self.header(cmd: .caps))
         pdu.append(0)
-        pdu.appendU16(version)
+        pdu.appendU16(3)
         // PriorityCharge0–3 — equal share (non-zero so formula is defined).
         pdu.appendU16(1000)
         pdu.appendU16(1000)
         pdu.appendU16(1000)
         pdu.appendU16(1000)
-        return pdu
-    }
-
-    public func buildCreateResponse(
-        channelId: UInt32,
-        status: CreateStatus,
-        cbChannelId: UInt8 = 0
-    ) -> [UInt8] {
-        var pdu: [UInt8] = []
-        pdu.append(Self.header(cmd: .create, cbId: cbChannelId))
-        appendChannelId(&pdu, channelId: channelId, cbChannelId: cbChannelId)
-        pdu.appendU32(status.rawValue)
         return pdu
     }
 
@@ -551,31 +552,40 @@ public final class DynamicVCManager {
         priority: RDPSocket.WritePriority,
         onWritten: RDPSocket.WriteCompletion? = nil
     ) -> Int? {
-        guard !payloads.isEmpty, (send != nil || sendBatch != nil) else { return nil }
+        guard !payloads.isEmpty else { return nil }
 
         // Build all fragments while holding the same lock used by single writes;
         // no other DVC message can interleave into a video frame.
         sendLock.lock()
+        defer { sendLock.unlock() }
+        guard let sender = multitransportChannel == channelId ? multitransportSender : sendBatch else {
+            return nil
+        }
         var pdus: [[UInt8]] = []
         for payload in payloads {
             pdus.append(contentsOf: makeDataPDUs(channelId: channelId, payload: payload))
         }
-        guard !pdus.isEmpty else {
-            sendLock.unlock()
-            return nil
-        }
-        let sentBytes: Int?
-        if let sendBatch {
-            sentBytes = sendBatch(pdus, priority, onWritten)
-        } else if let send {
-            for pdu in pdus { send(pdu) }
-            onWritten?(DispatchTime.now().uptimeNanoseconds)
-            sentBytes = pdus.reduce(0) { $0 + $1.count }
-        } else {
-            sentBytes = nil
-        }
+        guard !pdus.isEmpty else { return nil }
+        return sender(pdus, priority, onWritten)
+    }
+
+    /// The request shares the ordered TCP graphics lane with earlier frames. New
+    /// data enters UDP atomically, and TLS output waits for this TCP flush.
+    func switchToMultitransport(channelId: UInt32, onTCPFlushed: @escaping RDPSocket.WriteCompletion) -> Bool {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        guard multitransportChannel == nil, channelsById[channelId] != nil,
+              multitransportSender != nil, let sendBatch,
+              sendBatch([MultitransportPDU.softSyncRequest(channelID: channelId)], .graphicsControl, onTCPFlushed) != nil
+        else { return false }
+        multitransportChannel = channelId
+        return true
+    }
+
+    func resetMultitransport(channelId: UInt32? = nil) {
+        sendLock.lock()
+        if channelId == nil || multitransportChannel == channelId { multitransportChannel = nil }
         sendLock.unlock()
-        return sentBytes
     }
 
     private func makeDataPDUs(channelId: UInt32, payload: [UInt8]) -> [[UInt8]] {
@@ -586,7 +596,7 @@ public final class DynamicVCManager {
         let total = UInt32(payload.count)
         let cbChannelId = Self.widthCode(for: channelId)
         let channelIdBytes = Self.byteWidth(for: cbChannelId)
-        let maxChunk = Self.maxTCPDataChunkBytes
+        let maxChunk = Self.maxDataPDUBytes
         let singlePayloadLimit = maxChunk - (1 + channelIdBytes)
         guard singlePayloadLimit > 0 else { return [] }
 
@@ -670,16 +680,6 @@ public final class DynamicVCManager {
         offset += width
         return value
     }
-
-    private func readNullTerminatedUTF8(_ pdu: [UInt8], offset: inout Int) -> String? {
-        guard offset < pdu.count else { return nil }
-        var end = offset
-        while end < pdu.count, pdu[end] != 0 { end += 1 }
-        guard end < pdu.count else { return nil }
-        let bytes = Array(pdu[offset..<end])
-        offset = end + 1
-        return String(bytes: bytes, encoding: .utf8)
-    }
 }
 
 /// Thin VirtualChannel adapter for the static `drdynvc` channel.
@@ -697,13 +697,7 @@ public final class DrdynvcChannel: VirtualChannel {
         RDPLog.channels.debug("drdynvc open \(channelId)")
         manager.send = { [weak self] pdu in self?.send?(pdu) }
         manager.sendBatch = { [weak self] pdus, priority, onWritten in
-            guard let self else { return nil }
-            if let sendBatch = self.sendBatch {
-                return sendBatch(pdus, priority, onWritten)
-            }
-            for pdu in pdus { self.send?(pdu) }
-            onWritten?(DispatchTime.now().uptimeNanoseconds)
-            return pdus.reduce(0) { $0 + $1.count }
+            self?.sendBatch?(pdus, priority, onWritten)
         }
         // CAPS is sent from RDPSession after Confirm Active (session path),
         // not at MCS Channel Join (too early for iPhone — before Client Info).

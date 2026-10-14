@@ -4,27 +4,35 @@ import SwiftRDPCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    static weak var shared: AppDelegate?
+    let prefs: AppPreferences
+    let settings = SettingsState()
 
     private var sessionManager: SessionManager?
-    private var sessionPollTimer: Timer?
+    private lazy var menuBar = MenuBarController(prefs: prefs) { [weak self] action in
+        self?.handleMenuAction(action)
+    }
     private var observedSessionID: UUID?
     private var instanceLockFD: Int32 = -1
     private let hostAudioSuppressor = HostAudioSuppressor()
     private let remoteSessionSecurityController = RemoteSessionSecurityController()
 
-    private var prefs: AppPreferences { .shared }
+    override convenience init() {
+        self.init(prefs: .shared)
+    }
+
+    init(prefs: AppPreferences) {
+        self.prefs = prefs
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard acquireInstanceLock() else {
             NSApp.terminate(nil)
             return
         }
-        Self.shared = self
         NSApp.setActivationPolicy(.accessory)
-        SettingsCoordinator.shared.install()
 
-        startSessionPolling()
+        menuBar.install()
 
         if prefs.launchAtLogin {
             LaunchAtLogin.setEnabled(true)
@@ -42,9 +50,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         prefs.applyVideoAdaptationPriorityLiveHandler = { [weak self] priority in
             self?.sessionManager?.applyVideoAdaptationPriority(priority)
         }
+        prefs.applyDefaultVideoTargetsLiveHandler = { [weak self] quality, fps in
+            self?.sessionManager?.updateDefaultVideoTargets(quality: quality, fps: fps)
+        }
         prefs.applyAudioPlaybackDestinationLiveHandler = { [weak self] destination in
             self?.sessionManager?.applyAudioPlaybackDestination(destination)
-            self?.updateRuntimeState()
         }
         prefs.applyRemotePointerScaleHandler = { [weak self] scale in
             self?.sessionManager?.applyRemotePointerScale(scale)
@@ -70,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !PermissionGate.allGranted {
                 _ = PermissionGate.requestScreenRecording()
                 PermissionGate.requestAccessibility(prompt: true)
-                SettingsCoordinator.shared.open(section: .permissions)
+                self.settings.requestOpen(section: .permissions)
             }
             if self.prefs.autoStartServer {
                 self.startServer()
@@ -84,8 +94,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        settings.requestOpen()
+        return false
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        sessionPollTimer?.invalidate()
+        menuBar.remove()
         hostAudioSuppressor.setSuppressed(false)
         remoteSessionSecurityController.update(enabled: false, sessionID: nil)
         if let manager = sessionManager {
@@ -114,7 +133,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    func toggleServer() {
+    func handleMenuAction(_ action: AppAction) {
+        switch action {
+        case .refreshStatus: updateRuntimeState()
+        case .toggleServer: toggleServer()
+        case .copyAddress: copyConnection()
+        case .disconnect: disconnectClient()
+        case .quit: quit()
+        case .quality(let mode): applyVideoQuality(mode)
+        case .fps(let fps): applyVideoFPS(fps)
+        case .audio(let destination): applyAudioDestination(destination)
+        case .resolution(let option): applyResolution(option)
+        case .settings(let section): settings.requestOpen(section: section)
+        }
+    }
+
+    private func toggleServer() {
         if prefs.isServerRunning {
             stopServer()
         } else {
@@ -122,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func copyConnection() {
+    private func copyConnection() {
         let addresses = prefs.connectionAddresses()
         let text = addresses.joined(separator: "\n")
         NSPasteboard.general.clearContents()
@@ -130,30 +164,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RDPLog.app.info("Copied connection address(es): \(text)")
     }
 
-    func disconnectClient() {
+    private func disconnectClient() {
         guard prefs.isServerRunning, let manager = sessionManager else { return }
         RDPLog.app.info("Disconnect: terminating current client")
         manager.terminateCurrentSession()
         updateRuntimeState()
     }
 
-    func quit() {
+    private func quit() {
         stopServer()
         NSApp.terminate(nil)
     }
 
-    func applyVideoQuality(_ preset: VideoQualityPreset) {
-        RDPLog.app.notice("Video quality -> \(preset.title)")
+    private func applyVideoQuality(_ mode: VideoQualityMode) {
+        RDPLog.app.notice("Video quality -> \(mode.title)")
         if let manager = sessionManager, manager.hasActiveSession {
             updateRememberedSettings(for: manager.connectionSnapshot) {
-                $0.videoBitrate = preset.rawValue
+                $0.videoQuality.mode = mode
             }
         } else {
-            prefs.videoBitrate = preset.rawValue
+            prefs.videoQuality.mode = mode
         }
     }
 
-    func applyVideoFPS(_ preset: VideoFPSPreset) {
+    private func applyVideoFPS(_ preset: VideoFPSPreset) {
         RDPLog.app.notice("Video FPS -> \(preset.title)")
         if let manager = sessionManager, manager.hasActiveSession {
             updateRememberedSettings(for: manager.connectionSnapshot) {
@@ -164,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applyAudioDestination(_ destination: AudioPlaybackDestination) {
+    private func applyAudioDestination(_ destination: AudioPlaybackDestination) {
         if let manager = sessionManager, manager.hasActiveSession {
             let snapshot = manager.connectionSnapshot
             guard destination != snapshot.audioPlaybackDestination else { return }
@@ -178,7 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RDPLog.app.notice("Audio playback -> \(destination.rawValue)")
     }
 
-    func applyResolution(_ option: HostResolutionOption) {
+    private func applyResolution(_ option: HostResolutionOption) {
         guard option.width > 0, option.height > 0,
               let manager = sessionManager, manager.hasActiveSession else { return }
 
@@ -231,12 +265,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     enabled: self.prefs.keepScreenUnlockedWhileConnected && self.prefs.authEnabled,
                     sessionID: sessionID
                 )
+                self.updateRuntimeState()
             }
         }
         manager.onAuthenticatedSessionEnded = { [weak self] sessionID in
             Task { @MainActor [weak self] in
                 self?.remoteSessionSecurityController.sessionEnded(sessionID)
+                self?.updateRuntimeState()
             }
+        }
+        manager.onSessionStateChanged = { [weak self] in
+            Task { @MainActor [weak self] in self?.updateRuntimeState() }
         }
         VirtualDisplayManager.setPowerPolicy(
             preventSystemSleep: prefs.preventSystemSleep,
@@ -298,15 +337,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func startSessionPolling() {
-        sessionPollTimer?.invalidate()
-        sessionPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.updateRuntimeState() }
-        }
-    }
-
     private func updateRuntimeState() {
         let running = prefs.isServerRunning
+        if !running {
+            settings.restartPending = false
+        }
         let restarting = prefs.isServerRestarting
         let manager = sessionManager
         let snapshot = manager?.connectionSnapshot ?? .empty
@@ -314,10 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let currentID = active ? snapshot.sessionID : nil
 
         if let currentID, observedSessionID != currentID {
-            prefs.rememberConnection(
-                clientName: snapshot.clientName,
-                peerAddress: snapshot.peerAddress
-            )
+            prefs.rememberConnection(snapshot)
         }
         observedSessionID = currentID
 
@@ -357,9 +389,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var settings = prefs.rememberedSessionStore.settings(for: identity)
             ?? RememberedSessionSettings(
                 identity: identity,
-                videoBitrate: prefs.videoBitrate,
-                videoFPS: prefs.videoFPS,
-                audioPlaybackDestination: prefs.audioPlaybackDestination
+                videoQuality: snapshot.videoQuality,
+                videoFPS: snapshot.configuredFPS,
+                audioPlaybackDestination: snapshot.audioPlaybackDestination
             )
         mutate(&settings)
         settings.lastConnectedAt = Date()
@@ -374,7 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             peerAddress: snapshot.peerAddress
         ).stableKey == settings.id else { return }
 
-        manager.applyVideoBitrate(settings.videoBitrate, to: snapshot.sessionID)
+        manager.applyVideoQuality(settings.videoQuality, to: snapshot.sessionID)
         manager.applyVideoFPS(settings.videoFPS, to: snapshot.sessionID)
         manager.applyAudioPlaybackDestination(
             settings.audioPlaybackDestination,
@@ -384,9 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             manager.applyHostResolution(
                 width: resolution.width,
                 height: resolution.height,
-                preferHiDPI: resolution.hiDPI,
-                logicalWidth: resolution.logicalWidth,
-                logicalHeight: resolution.logicalHeight
+                preferHiDPI: resolution.hiDPI
             )
         }
         updateRuntimeState()

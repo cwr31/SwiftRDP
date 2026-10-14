@@ -35,8 +35,7 @@ enum L10n {
     }
 
     enum Key {
-        // Settings sidebar / window
-        case settingsWindowTitle
+        // Settings sidebar
         case sectionGeneral, sectionConnections, sectionSession, sectionAudio, sectionPermissions, sectionDisplay, sectionInput, sectionLogs
         case settingsGroupServer, settingsGroupExperience, settingsGroupSupport
 
@@ -49,8 +48,6 @@ enum L10n {
         case openSystemSettings
         case refresh
         case allPermissionsGranted, actionNeeded
-        case permissionsAlertTitle, permissionsAlertBody
-        case openSettings, later
 
         // General
         case authentication
@@ -81,17 +78,18 @@ enum L10n {
         case language
 
         // Display
-        case sectionH264, displayMode
+        case sectionVideo, displayMode
         case displayModeBitmap, displayModeH264, displayModeRemoteFX
         case videoQuality
         case videoFPS
-        case qualityMbps2, qualityMbps8, qualityMbps20
-        case qualityMbps50, qualityMbps100, videoQualityHelp
-        case fpsRateTitle
+        case qualityAutomatic, qualityOriginal, qualityUltra, qualityHigh, qualityCustom
+        case videoQualityHelp, videoFPSHelp, fpsRateTitle
+        case videoBitrate, customBitrateValue, customBitrateHelp, customBitratePrompt
+        case defaultVideoSettingsHelp
         case monitors, displaySource, displayToShare, autoPrimaryDisplay, displayN
         case displaySourceAutomatic, displaySourceVirtual
         case hostDisplayPolicyHelp
-        case resolutionMenu, resolutionMenuPhysical, resolutionMenuVirtual, menuVideo, menuAudio
+        case resolutionMenu, resolutionMenuPhysical, resolutionMenuVirtual, menuAudio
         case noResolutionOptions
         case videoAdaptationPriority
         case adaptationQualityFirst, adaptationFPSFirst
@@ -150,7 +148,6 @@ enum L10n {
 
         var en: String {
             switch self {
-            case .settingsWindowTitle: return "SwiftRDP Settings"
             case .sectionGeneral: return "General"
             case .sectionConnections: return "Connections"
             case .sectionSession: return "Session"
@@ -176,11 +173,6 @@ enum L10n {
             case .refresh: return "Refresh"
             case .allPermissionsGranted: return "All required permissions granted"
             case .actionNeeded: return "Action needed"
-            case .permissionsAlertTitle: return "Permissions Required"
-            case .permissionsAlertBody:
-                return "SwiftRDP needs:\n\n• Screen Recording — capture the Mac display for RDP\n• Accessibility — inject keyboard and mouse from the remote client\n\nYou can also check status anytime in Settings → Permissions."
-            case .openSettings: return "Open Settings"
-            case .later: return "Later"
 
             case .authentication: return "Authentication"
             case .requireAuthNLA: return "Require authentication (NLA)"
@@ -225,21 +217,27 @@ enum L10n {
             case .keepUnlockedHelp: return "Automatically unlock an idle Lock Screen on connect and keep the session active until disconnect. Requires Accessibility, RDP authentication, and a saved Mac login password."
             case .language: return "Language"
 
-            case .sectionH264: return "H.264"
+            case .sectionVideo: return "Picture"
             case .displayMode: return "Display Mode"
             case .displayModeBitmap: return "Bitmap"
             case .displayModeH264: return "H.264"
             case .displayModeRemoteFX: return "RemoteFX"
-            case .videoQuality: return "Video Quality"
-            case .qualityMbps2: return "2 Mbps"
-            case .qualityMbps8: return "8 Mbps"
-            case .qualityMbps20: return "20 Mbps"
-            case .qualityMbps50: return "50 Mbps"
-            case .qualityMbps100: return "100 Mbps"
+            case .videoQuality: return "Picture Quality"
+            case .qualityAutomatic: return "Auto (Original)"
+            case .qualityOriginal: return "Original 20M"
+            case .qualityUltra: return "Ultra HD 8M"
+            case .qualityHigh: return "HD 2M"
+            case .qualityCustom: return "Custom"
             case .videoQualityHelp:
-                return "Bitrate ceiling. The controller adapts down when the link, client queue, or encoder is under pressure. H.264 remains compressed, not lossless."
-            case .videoFPS: return "Frame Rate"
+                return "Auto uses the Original tier's 20 Mbps ceiling. All tiers adapt to network and device load. Original is a quality preset, not lossless encoding."
+            case .videoFPS: return "Frame Rate Limit"
+            case .videoFPSHelp: return "Maximum frame rate. Actual updates depend on screen activity, network conditions, and device performance."
             case .fpsRateTitle: return "%d fps"
+            case .videoBitrate: return "Bitrate"
+            case .customBitrateValue: return "%d / %d Mbps"
+            case .customBitrateHelp: return "Drag to set a custom video bitrate ceiling from 1 to 500 Mbps. Changes apply on release, without a separate switch. Network adaptation remains active."
+            case .customBitratePrompt: return "Enable Custom Bitrate"
+            case .defaultVideoSettingsHelp: return "Defaults for new clients. Use Connections or the menu bar to change a remembered client's settings."
             case .monitors: return "Monitors"
             case .displaySource: return "Desktop source"
             case .displayToShare: return "Display to share"
@@ -251,7 +249,6 @@ enum L10n {
             case .resolutionMenu: return "Resolution"
             case .resolutionMenuPhysical: return "Physical display"
             case .resolutionMenuVirtual: return "Virtual display"
-            case .menuVideo: return "Video"
             case .menuAudio: return "Audio"
             case .noResolutionOptions: return "No resolutions available"
             case .videoAdaptationPriority: return "When targets can't be met"
@@ -361,7 +358,6 @@ enum L10n {
 
         var zh: String {
             switch self {
-            case .settingsWindowTitle: return "SwiftRDP 设置"
             case .sectionGeneral: return "通用"
             case .sectionConnections: return "连接"
             case .sectionSession: return "会话"
@@ -387,11 +383,6 @@ enum L10n {
             case .refresh: return "刷新"
             case .allPermissionsGranted: return "所需权限均已授予"
             case .actionNeeded: return "需要操作"
-            case .permissionsAlertTitle: return "需要权限"
-            case .permissionsAlertBody:
-                return "SwiftRDP 需要：\n\n• 屏幕录制 — 捕获 Mac 屏幕用于 RDP\n• 辅助功能 — 注入远程客户端的键盘和鼠标\n\n也可随时在“设置 → 权限”中查看状态。"
-            case .openSettings: return "打开设置"
-            case .later: return "稍后"
 
             case .authentication: return "身份验证"
             case .requireAuthNLA: return "要求身份验证（NLA）"
@@ -436,21 +427,27 @@ enum L10n {
             case .keepUnlockedHelp: return "连接时自动解锁空闲锁屏，并在断开前保持会话活跃。需要辅助功能权限、RDP 身份验证和已保存的 Mac 登录密码。"
             case .language: return "语言"
 
-            case .sectionH264: return "H.264"
+            case .sectionVideo: return "画面"
             case .displayMode: return "显示模式"
             case .displayModeBitmap: return "位图"
             case .displayModeH264: return "H.264"
             case .displayModeRemoteFX: return "RemoteFX"
-            case .videoQuality: return "视频质量"
-            case .qualityMbps2: return "2 Mbps"
-            case .qualityMbps8: return "8 Mbps"
-            case .qualityMbps20: return "20 Mbps"
-            case .qualityMbps50: return "50 Mbps"
-            case .qualityMbps100: return "100 Mbps"
+            case .videoQuality: return "画质"
+            case .qualityAutomatic: return "自动（原画）"
+            case .qualityOriginal: return "原画 20M"
+            case .qualityUltra: return "超清 8M"
+            case .qualityHigh: return "高清 2M"
+            case .qualityCustom: return "自定义"
             case .videoQualityHelp:
-                return "码率上限。网络、客户端队列或编码器有压力时，控制器会自动降低码率或帧率。H.264 仍有压缩，不是无损。"
-            case .videoFPS: return "帧率"
-            case .fpsRateTitle: return "%d fps"
+                return "自动使用原画档的 20 Mbps 上限。所有档位均会根据网络和设备负载自适应调整；“原画”是画质档位，不代表无损。"
+            case .videoFPS: return "帧率上限"
+            case .videoFPSHelp: return "设置最高帧率，实际更新速度取决于画面变化、网络状况和设备性能。"
+            case .fpsRateTitle: return "%d 帧"
+            case .videoBitrate: return "码率"
+            case .customBitrateValue: return "%d / %d Mbps"
+            case .customBitrateHelp: return "拖动即可设置 1–500 Mbps 的自定义视频码率，松手后生效，无需额外开关。网络自适应仍然生效。"
+            case .customBitratePrompt: return "启用自定义码率"
+            case .defaultVideoSettingsHelp: return "这里设置新客户端的默认值。已记住的客户端请在“连接”或菜单栏中调整。"
             case .monitors: return "显示器"
             case .displaySource: return "桌面来源"
             case .displayToShare: return "共享的显示器"
@@ -462,7 +459,6 @@ enum L10n {
             case .resolutionMenu: return "分辨率"
             case .resolutionMenuPhysical: return "物理屏"
             case .resolutionMenuVirtual: return "虚拟屏"
-            case .menuVideo: return "视频"
             case .menuAudio: return "音频"
             case .noResolutionOptions: return "暂无可用分辨率"
             case .videoAdaptationPriority: return "无法同时达标时"
@@ -570,8 +566,4 @@ enum L10n {
             }
         }
     }
-}
-
-extension Notification.Name {
-    static let appLanguageDidChange = Notification.Name("SwiftRDPAppLanguageDidChange")
 }

@@ -3,14 +3,12 @@ import CryptoKit
 import CommonCrypto
 
 /// Minimal NTLMv2 server for CredSSP/NLA (MS-NLMP).
-/// Aligns with behavior: TargetInfo AV pairs, session key export, optional NT hash store under Application Support.
 public final class NTLMServer: @unchecked Sendable {
     public let username: String
-    public let password: String
     public let domain: String
     /// Host name used for NTLM TargetName / TargetInfo (NetBIOS + DNS AV pairs).
     public let serverName: String
-    public let ntlmStoreURL: URL?
+    private let passwordHash: [UInt8]
 
     public private(set) var serverChallenge: [UInt8] = []
     public private(set) var negotiateFlags: UInt32 = 0
@@ -47,14 +45,12 @@ public final class NTLMServer: @unchecked Sendable {
         username: String,
         password: String,
         domain: String = "",
-        serverName: String = "SwiftRDP",
-        ntlmStoreURL: URL? = nil
+        serverName: String = "SwiftRDP"
     ) {
         self.username = username
-        self.password = password
+        self.passwordHash = Self.ntHash(password: password)
         self.domain = domain
         self.serverName = serverName.isEmpty ? "SwiftRDP" : serverName
-        self.ntlmStoreURL = ntlmStoreURL
     }
 
     public func processNegotiate(_ token: [UInt8]) throws -> [UInt8] {
@@ -82,13 +78,11 @@ public final class NTLMServer: @unchecked Sendable {
         guard Array(token[0..<8]) == Array("NTLMSSP\0".utf8) else { return false }
         guard u32(token, 8) == 3 else { return false }
 
-        let lmResp = readSecBuffer(token, offset: 12)
         let ntResp = readSecBuffer(token, offset: 20)
         let domainBuf = readSecBuffer(token, offset: 28)
         let userBuf = readSecBuffer(token, offset: 36)
         let encSessionKey = readSecBuffer(token, offset: 52)
-        let flags = token.count >= 64 ? u32(token, 60) : negotiateFlags
-        _ = lmResp
+        let flags = u32(token, 60)
 
         let user = String(bytes: userBuf, encoding: .utf16LittleEndian) ?? ""
         let dom = String(bytes: domainBuf, encoding: .utf16LittleEndian) ?? ""
@@ -101,22 +95,17 @@ public final class NTLMServer: @unchecked Sendable {
             return false
         }
 
-        let ntHash = loadOrComputeNTHash(for: user)
-        var verified = false
-        if ntResp.count >= 16 {
-            verified = verifyNTLMv2(
-                ntHash: ntHash,
-                username: user,
-                domain: dom,
-                serverChallenge: serverChallenge,
-                ntResponse: ntResp
-            )
-        }
+        let verified = verifyNTLMv2(
+            ntHash: passwordHash,
+            username: user,
+            domain: dom,
+            serverChallenge: serverChallenge,
+            ntResponse: ntResp
+        )
 
         if verified {
             RDPLog.auth.info("CredSSP: NTLM session key computed successfully")
-            deriveSessionKey(ntHash: ntHash, username: user, domain: dom, ntResponse: ntResp, encSessionKey: encSessionKey, flags: flags)
-            persistNTHash(user: user, hash: ntHash)
+            deriveSessionKey(ntHash: passwordHash, username: user, domain: dom, ntResponse: ntResp, encSessionKey: encSessionKey, flags: flags)
             RDPLog.auth.info("CredSSP: Authentication successful for user=\(user)")
             return true
         }
@@ -313,61 +302,10 @@ public final class NTLMServer: @unchecked Sendable {
         Array(Insecure.MD5.hash(data: Data(data)))
     }
 
-    // MARK: - NT hash store (compatible layout idea)
-
-    private func loadOrComputeNTHash(for user: String) -> [UInt8] {
-        if let url = ntlmStoreURL {
-            let file = url.appendingPathComponent("\(user.lowercased()).hash")
-            if let data = try? Data(contentsOf: file), data.count == 16 {
-                RDPLog.auth.debug("CredSSP: loaded stored NT hash for '\(user)'")
-                return [UInt8](data)
-            }
-        }
-        return Self.ntHash(password: password)
-    }
-
-    private func persistNTHash(user: String, hash: [UInt8]) {
-        guard let url = ntlmStoreURL else { return }
-        do {
-            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-            let file = url.appendingPathComponent("\(user.lowercased()).hash")
-            try Data(hash).write(to: file, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-            RDPLog.auth.debug("CredSSP: migrated NT hash for '\(user)'")
-        } catch {
-            RDPLog.auth.debug("CredSSP: NT hash persist failed: \(error)")
-        }
-    }
-
     // MARK: - Crypto
 
     public static func ntHash(password: String) -> [UInt8] {
         md4(utf16LE(password))
-    }
-
-    /// Remove cached NT hashes so a newly configured password takes effect immediately.
-    public static func invalidateStoredHashes(in directory: URL) {
-        guard FileManager.default.fileExists(atPath: directory.path) else { return }
-        if let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
-            for file in files where file.pathExtension == "hash" {
-                try? FileManager.default.removeItem(at: file)
-                RDPLog.auth.info("Auth: NT hash deleted for '\(file.deletingPathExtension().lastPathComponent)'")
-            }
-        }
-    }
-
-    /// Write the NT hash for the configured username/password (call after Settings save).
-    public static func storeHash(username: String, password: String, in directory: URL) {
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let hash = ntHash(password: password)
-            let file = directory.appendingPathComponent("\(username.lowercased()).hash")
-            try Data(hash).write(to: file, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
-            RDPLog.auth.info("Auth: NT hash stored for '\(username)'")
-        } catch {
-            RDPLog.auth.error("Auth: Failed to store NT hash: \(error)")
-        }
     }
 
     private func verifyNTLMv2(

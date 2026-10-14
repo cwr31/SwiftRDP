@@ -38,6 +38,18 @@ public struct CapturedFrame: @unchecked Sendable {
 /// complete frame and can account for consumer-skipped samples through
 /// `markDelivered(sequence:after:)`.
 public final class FrameHub: @unchecked Sendable {
+    public struct Snapshot: Sendable {
+        public let frame: CapturedFrame
+        public let sequence: UInt64
+
+        /// Missing samples also lose their dirty regions, so inspect the full frame.
+        public func dirtyRects(after previousSequence: UInt64) -> [CGRect]? {
+            guard sequence != previousSequence else { return [] }
+            guard previousSequence > 0, sequence == previousSequence &+ 1 else { return nil }
+            return frame.dirtyRects
+        }
+    }
+
     public struct Statistics: Sendable, Equatable {
         public let publishedFrames: UInt64
         public let deliveredFrames: UInt64
@@ -104,11 +116,11 @@ public final class FrameHub: @unchecked Sendable {
         return latestFrame
     }
 
-    public func currentFrameSnapshot() -> (frame: CapturedFrame, sequence: UInt64)? {
+    public func currentFrameSnapshot() -> Snapshot? {
         lock.lock()
         defer { lock.unlock() }
         guard let latestFrame else { return nil }
-        return (latestFrame, sequence)
+        return Snapshot(frame: latestFrame, sequence: sequence)
     }
 
     /// Mark the newest frame accepted by a consumer. This measures the frames

@@ -3,7 +3,6 @@ import CoreGraphics
 import QuartzCore
 
 /// Injects mouse events from RDP slow-path or fast-path input.
-/// `MouseHandler` field surface ( / ).
 public final class MouseHandler: @unchecked Sendable {
     /// Live prefs — Settings updates these without restarting the server.
     private static let settingsLock = NSLock()
@@ -38,19 +37,7 @@ public final class MouseHandler: @unchecked Sendable {
 
     /// `buttonsDown` bitmask (PTRFLAGS button bits while held).
     private var buttonsDown: UInt16 = 0
-    public var scaleX: CGFloat = 1
-    public var scaleY: CGFloat = 1
-    public var letterboxOffsetX: CGFloat = 0
-    public var letterboxOffsetY: CGFloat = 0
-    /// RDP content rect after letterbox, in desktop coordinates.
-    public var contentWidth: CGFloat = 0
-    public var contentHeight: CGFloat = 0
-    /// Host display extent, in Quartz coordinates, for relative-pointer clamping.
-    public var captureAreaWidth: CGFloat = 0
-    public var captureAreaHeight: CGFloat = 0
-    /// `screenOriginX/Y` — `CGDisplayBounds.origin`.
-    public var originX: CGFloat = 0
-    public var originY: CGFloat = 0
+    public var coordinateMapping: DesktopInputMapping?
 
     private var lastClickTime: CFTimeInterval = 0
     private var lastClickPos: CGPoint = .zero
@@ -61,10 +48,9 @@ public final class MouseHandler: @unchecked Sendable {
     /// init `5.0`.
     public var doubleClickRadius: CGFloat = 5.0
 
-    private var lastX: Int = 0
-    private var lastY: Int = 0
+    private var lastPointerHostPoint: CGPoint?
     private var loggedEvents = 0
-    /// Coalesce pure mouse-move CGEvents (~125 Hz) — RDP still tracks lastX/Y.
+    /// Coalesce pure hover CGEvents while retaining the latest pointer position.
     private var lastMoveInjectTime: CFTimeInterval = 0
     private static let moveCoalesceInterval: CFTimeInterval = 0.008
 
@@ -73,23 +59,8 @@ public final class MouseHandler: @unchecked Sendable {
 
     public init() {}
 
-    /// Remap cached RDP coords after desktop resize / mode flip (wheel uses lastX/Y).
-    public func noteDesktopGeometryChanged(
-        oldDesktopWidth: Int,
-        oldDesktopHeight: Int,
-        newDesktopWidth: Int,
-        newDesktopHeight: Int
-    ) {
-        guard oldDesktopWidth > 0, oldDesktopHeight > 0,
-              newDesktopWidth > 0, newDesktopHeight > 0 else { return }
-        guard oldDesktopWidth != newDesktopWidth || oldDesktopHeight != newDesktopHeight else { return }
-        let nx = lastX * newDesktopWidth / oldDesktopWidth
-        let ny = lastY * newDesktopHeight / oldDesktopHeight
-        lastX = min(max(nx, 0), max(newDesktopWidth - 1, 0))
-        lastY = min(max(ny, 0), max(newDesktopHeight - 1, 0))
-    }
-
     public func injectMouse(flags: UInt16, x: Int, y: Int) {
+        guard let mapping = coordinateMapping else { return }
         let down = (flags & 0x8000) != 0
         let button1 = (flags & 0x1000) != 0
         let button2 = (flags & 0x2000) != 0
@@ -102,17 +73,19 @@ public final class MouseHandler: @unchecked Sendable {
         // send (0,0). Scroll at the last known pointer position instead.
         let rdpX: Int
         let rdpY: Int
+        let pt: CGPoint
         if wheel || hwheel {
-            rdpX = lastX
-            rdpY = lastY
+            guard let previous = lastPointerHostPoint ?? CGEvent(source: nil)?.location else { return }
+            pt = mapping.clampedHostPoint(previous)
+            let desktop = mapping.desktopPoint(for: pt)
+            rdpX = Int(desktop.x.rounded())
+            rdpY = Int(desktop.y.rounded())
         } else {
             rdpX = x
             rdpY = y
-            lastX = x
-            lastY = y
+            pt = mapping.hostPoint(x: x, y: y)
         }
-
-        let pt = absolutePoint(x: rdpX, y: rdpY)
+        lastPointerHostPoint = pt
 
         let isButtonOrWheel = button1 || button2 || button3 || wheel || hwheel
         if isButtonOrWheel || loggedEvents < 4 {
@@ -302,9 +275,8 @@ public final class MouseHandler: @unchecked Sendable {
         let button2 = (flags & 0x0002) != 0
         guard button1 || button2 else { return }
 
-        lastX = x
-        lastY = y
-        let pt = absolutePoint(x: x, y: y)
+        guard let pt = absolutePoint(x: x, y: y) else { return }
+        lastPointerHostPoint = pt
 
         // Map XBUTTON1/2 to Quartz other-mouse buttons 3 and 4 (0-based buttonNumber).
         let buttonNumber: Int64 = button1 ? 3 : 4
@@ -327,40 +299,24 @@ public final class MouseHandler: @unchecked Sendable {
         onPointerMoved?(x, y)
     }
 
-    private func absolutePoint(x: Int, y: Int) -> CGPoint {
-        let rawX = max(CGFloat(x) - letterboxOffsetX, 0)
-        let rawY = max(CGFloat(y) - letterboxOffsetY, 0)
-        let contentX = contentWidth > 0 ? min(rawX, contentWidth) : rawX
-        let contentY = contentHeight > 0 ? min(rawY, contentHeight) : rawY
-        return CGPoint(
-            x: originX + contentX * scaleX,
-            y: originY + contentY * scaleY
-        )
+    func absolutePoint(x: Int, y: Int) -> CGPoint? {
+        coordinateMapping?.hostPoint(x: x, y: y)
     }
 
     /// Relative mouse (MS-RDPBCGR TS_RELPOINTER_EVENT / Fast-Path MOUSEREL).
     public func injectRelative(flags: UInt16, dx: Int16, dy: Int16) {
+        guard let mapping = coordinateMapping else { return }
         let move = (flags & 0x0800) != 0
         let down = (flags & 0x8000) != 0
         let button1 = (flags & 0x1000) != 0
         let button2 = (flags & 0x2000) != 0
         let button3 = (flags & 0x4000) != 0
 
-        let current = CGEvent(source: nil)?.location ?? CGPoint(x: originX, y: originY)
-        // RDP yDelta: negative = up. Quartz Y grows downward — flip.
-        let scaledDX = CGFloat(dx) * scaleX
-        let scaledDY = CGFloat(-dy) * scaleY
-        var pt = CGPoint(x: current.x + scaledDX, y: current.y + scaledDY)
-
-        // Keep inside the capture area when known.
-        if captureAreaWidth > 0, captureAreaHeight > 0 {
-            let minX = originX
-            let minY = originY
-            let maxX = originX + captureAreaWidth - 1
-            let maxY = originY + captureAreaHeight - 1
-            pt.x = min(max(pt.x, minX), maxX)
-            pt.y = min(max(pt.y, minY), maxY)
-        }
+        guard let current = CGEvent(source: nil)?.location else { return }
+        let delta = mapping.hostDelta(dx: dx, dy: dy)
+        let pt = mapping.clampedHostPoint(
+            CGPoint(x: current.x + delta.dx, y: current.y + delta.dy)
+        )
 
         if button1 {
             handleButton(button: 0, bit: 0x1000, down: down, at: pt)
@@ -385,17 +341,16 @@ public final class MouseHandler: @unchecked Sendable {
                 btn = .left
             }
             if let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pt, mouseButton: btn) {
-                e.setIntegerValueField(.mouseEventDeltaX, value: Int64(scaledDX.rounded()))
-                e.setIntegerValueField(.mouseEventDeltaY, value: Int64(scaledDY.rounded()))
+                e.setIntegerValueField(.mouseEventDeltaX, value: Int64(delta.dx.rounded()))
+                e.setIntegerValueField(.mouseEventDeltaY, value: Int64(delta.dy.rounded()))
                 e.post(tap: .cghidEventTap)
             }
         }
 
-        // Approximate RDP desktop coords for cursor shadow.
-        let rdpX = Int(((pt.x - originX) / max(scaleX, 0.0001) + letterboxOffsetX).rounded())
-        let rdpY = Int(((pt.y - originY) / max(scaleY, 0.0001) + letterboxOffsetY).rounded())
-        lastX = rdpX
-        lastY = rdpY
+        let desktopPoint = mapping.desktopPoint(for: pt)
+        let rdpX = Int(desktopPoint.x.rounded())
+        let rdpY = Int(desktopPoint.y.rounded())
+        lastPointerHostPoint = pt
         onPointerMoved?(rdpX, rdpY)
     }
 }

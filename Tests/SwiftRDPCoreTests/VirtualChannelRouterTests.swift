@@ -50,6 +50,16 @@ final class VirtualChannelRouterTests: XCTestCase {
         XCTAssertEqual(channel.openedChannelIDs, [1004])
     }
 
+    func testChannelNamesMustMatchExactlyInsteadOfUsingPrefixAliases() {
+        let router = VirtualChannelRouter()
+        let channel = OpenTrackingChannel(name: "test")
+        router.register(channel)
+        router.bind(channelId: 1004, name: "testx")
+        XCTAssertTrue(channel.openedChannelIDs.isEmpty)
+        router.bind(channelId: 1005, name: "test")
+        XCTAssertEqual(channel.openedChannelIDs, [1005])
+    }
+
     func testDynamicVCBatchKeepsStaticChannelFraming() {
         let router = VirtualChannelRouter()
         var batches: [[[UInt8]]] = []
@@ -72,6 +82,33 @@ final class VirtualChannelRouterTests: XCTestCase {
         let header = try! XCTUnwrap(ChannelPDU.parse(staticPDU))
         XCTAssertEqual(header.flags, ChannelPDU.flagFirst | ChannelPDU.flagLast)
         XCTAssertEqual(header.length, header.payload.count)
+    }
+
+    func testStaticChannelsBatchAllFragmentsWithTheirNativePriority() {
+        let priorities: [(String, RDPSocket.WritePriority)] = [
+            ("cliprdr", .control), ("rdpsnd", .audio), ("drdynvc", .control),
+        ]
+        for (name, expectedPriority) in priorities {
+            let router = VirtualChannelRouter()
+            let channel = OpenTrackingChannel(name: name)
+            router.register(channel)
+            router.chunkSize = 4
+            var batches = 0
+            var delivered: [UInt8] = []
+            router.sendToChannelBatch = { id, packets, priority, onWritten in
+                XCTAssertEqual(id, 1004)
+                XCTAssertEqual(priority, expectedPriority)
+                XCTAssertNil(onWritten)
+                batches += 1
+                delivered = packets.flatMap { ChannelPDU.parse($0)!.payload }
+                return packets.reduce(0) { $0 + $1.count }
+            }
+            router.bind(channelId: 1004, name: name)
+            let payload: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+            channel.send?(payload)
+            XCTAssertEqual(batches, 1)
+            XCTAssertEqual(delivered, payload)
+        }
     }
 }
 

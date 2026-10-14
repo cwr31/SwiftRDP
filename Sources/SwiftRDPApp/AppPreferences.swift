@@ -8,7 +8,7 @@ import Combine
 final class AppPreferences: ObservableObject {
     static let shared = AppPreferences()
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
     // MARK: Keys
 
@@ -25,14 +25,12 @@ final class AppPreferences: ObservableObject {
         static let displayMode = prefix + "displayMode"
         static let hostDisplayPolicy = prefix + "hostDisplayPolicy"
         static let selectedDisplayIdentity = prefix + "selectedDisplayIdentity"
-        static let videoBitrate = prefix + "videoBitrate"
+        static let videoQuality = prefix + "videoQuality"
         static let videoFPS = prefix + "videoFPS"
         static let videoAdaptationPriority = prefix + "videoAdaptationPriority"
         static let audioPlaybackDestination = prefix + "audioPlaybackDestination"
         static let appLanguage = prefix + "appLanguage"
         static let hasLaunchedBefore = prefix + "hasLaunchedBefore"
-        static let gfxEnabled = prefix + "gfxEnabled"
-        static let asyncEncoding = prefix + "asyncEncoding"
         static let tlsVersionMode = prefix + "tlsVersionMode"
         static let devLog = prefix + "devLog"
         static let wheelScrollSpeed = prefix + "wheelScrollSpeed"
@@ -75,17 +73,13 @@ final class AppPreferences: ObservableObject {
     var applyAndRestartHandler: (() -> Void)?
     /// Live-apply adaptation priority to running sessions (no restart).
     var applyVideoAdaptationPriorityLiveHandler: ((VideoAdaptationPriority) -> Void)?
+    var applyDefaultVideoTargetsLiveHandler: ((VideoQualitySettings, Int) -> Void)?
     var applyAudioPlaybackDestinationLiveHandler: ((AudioPlaybackDestination) -> Void)?
     var applyRemotePointerScaleHandler: ((Double) -> Void)?
     var applyKnownPeersOnlyLiveHandler: ((Bool) -> Void)?
 
     func applyCredentialsAndRestart() {
         defaults.set(password, forKey: Key.password)
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SwiftRDP", isDirectory: true)
-        let ntlmDir = support.appendingPathComponent("ntlm", isDirectory: true)
-        NTLMServer.invalidateStoredHashes(in: ntlmDir)
-        NTLMServer.storeHash(username: username, password: password, in: ntlmDir)
         credentialsDirty = false
         applyAndRestartHandler?()
     }
@@ -110,11 +104,19 @@ final class AppPreferences: ObservableObject {
     @Published var selectedDisplayIdentity: String {
         didSet { defaults.set(selectedDisplayIdentity, forKey: Key.selectedDisplayIdentity) }
     }
-    @Published var videoBitrate: Int {
-        didSet { defaults.set(videoBitrate, forKey: Key.videoBitrate) }
+    @Published var videoQuality: VideoQualitySettings {
+        didSet {
+            if let data = try? JSONEncoder().encode(videoQuality) {
+                defaults.set(data, forKey: Key.videoQuality)
+            }
+            applyDefaultVideoTargetsLiveHandler?(videoQuality, videoFPS)
+        }
     }
     @Published var videoFPS: Int {
-        didSet { defaults.set(videoFPS, forKey: Key.videoFPS) }
+        didSet {
+            defaults.set(videoFPS, forKey: Key.videoFPS)
+            applyDefaultVideoTargetsLiveHandler?(videoQuality, videoFPS)
+        }
     }
     @Published var videoAdaptationPriority: VideoAdaptationPriority {
         didSet {
@@ -127,9 +129,6 @@ final class AppPreferences: ObservableObject {
             defaults.set(audioPlaybackDestination.rawValue, forKey: Key.audioPlaybackDestination)
             applyAudioPlaybackDestinationLiveHandler?(audioPlaybackDestination)
         }
-    }
-    @Published var asyncEncoding: Bool {
-        didSet { defaults.set(asyncEncoding, forKey: Key.asyncEncoding) }
     }
     @Published var tlsVersionMode: TLSVersionMode {
         didSet { defaults.set(tlsVersionMode.rawValue, forKey: Key.tlsVersionMode) }
@@ -144,7 +143,6 @@ final class AppPreferences: ObservableObject {
         didSet {
             defaults.set(appLanguage, forKey: Key.appLanguage)
             L10n.setLanguage(appLanguage)
-            NotificationCenter.default.post(name: .appLanguageDidChange, object: nil)
         }
     }
     /// Multiplier for remote mouse-wheel notches (1.0 = natural Windows WHEEL_DELTA).
@@ -197,17 +195,17 @@ final class AppPreferences: ObservableObject {
     /// Shared connection history and successfully authenticated IP store.
     let connectionAudit = ConnectionAudit.shared
 
-    nonisolated let rememberedSessionStore = RememberedSessionStore()
+    nonisolated let rememberedSessionStore: RememberedSessionStore
     @Published private(set) var rememberedSessionSettings: [RememberedSessionSettings] = []
     var applyRememberedSessionSettingsLiveHandler: ((RememberedSessionSettings) -> Void)?
 
-    func rememberConnection(clientName: String, peerAddress: String) {
-        let identity = SessionClientIdentity(clientName: clientName, peerAddress: peerAddress)
+    func rememberConnection(_ snapshot: SessionManager.ConnectionSnapshot) {
+        let identity = SessionClientIdentity(clientName: snapshot.clientName, peerAddress: snapshot.peerAddress)
         _ = rememberedSessionStore.ensure(
             identity: identity,
-            defaultBitrate: videoBitrate,
-            defaultFPS: videoFPS,
-            defaultAudioDestination: audioPlaybackDestination
+            defaultQuality: snapshot.videoQuality,
+            defaultFPS: snapshot.configuredFPS,
+            defaultAudioDestination: snapshot.audioPlaybackDestination
         )
         refreshRememberedSessionSettings()
     }
@@ -216,6 +214,28 @@ final class AppPreferences: ObservableObject {
         rememberedSessionStore.update(settings)
         refreshRememberedSessionSettings()
         applyRememberedSessionSettingsLiveHandler?(settings)
+    }
+
+    func videoQuality(for clientID: String?) -> VideoQualitySettings? {
+        guard let clientID else { return videoQuality }
+        return rememberedSessionSettings.first { $0.id == clientID }?.videoQuality
+    }
+
+    func updateVideoQuality(_ quality: VideoQualitySettings, for clientID: String?) {
+        guard let clientID else {
+            videoQuality = quality
+            return
+        }
+        guard var settings = rememberedSessionSettings.first(where: { $0.id == clientID }) else { return }
+        settings.videoQuality = quality
+        updateRememberedSessionSettings(settings)
+    }
+
+    func applyCustomVideoBitrate(_ bitrate: Int, for clientID: String?) {
+        guard var quality = videoQuality(for: clientID) else { return }
+        quality.customBitrate = bitrate
+        quality.mode = .custom
+        updateVideoQuality(quality, for: clientID)
     }
 
     func forgetRememberedSessionSettings(id: String) {
@@ -259,8 +279,10 @@ final class AppPreferences: ObservableObject {
     /// Human-readable session line for the status menu.
     @Published var sessionStatusText = "No active session"
 
-    private init() {
-        let d = UserDefaults.standard
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        rememberedSessionStore = RememberedSessionStore(defaults: defaults)
+        let d = defaults
         if !d.bool(forKey: Key.hasLaunchedBefore) {
             d.set(true, forKey: Key.hasLaunchedBefore)
             d.set(3389, forKey: Key.serverPort)
@@ -274,13 +296,10 @@ final class AppPreferences: ObservableObject {
             d.set(DisplayMode.h264.rawValue, forKey: Key.displayMode)
             d.set(HostDisplayPolicy.automatic.rawValue, forKey: Key.hostDisplayPolicy)
             d.set("", forKey: Key.selectedDisplayIdentity)
-            d.set(VideoQualityPreset.default.rawValue, forKey: Key.videoBitrate)
             d.set(VideoFPSPreset.default.rawValue, forKey: Key.videoFPS)
             d.set(VideoAdaptationPriority.qualityFirst.rawValue, forKey: Key.videoAdaptationPriority)
             d.set(AudioPlaybackDestination.both.rawValue, forKey: Key.audioPlaybackDestination)
             d.set("English", forKey: Key.appLanguage)
-            d.set(true, forKey: Key.gfxEnabled)
-            d.set(true, forKey: Key.asyncEncoding)
             d.set(TLSVersionMode.tls12.rawValue, forKey: Key.tlsVersionMode)
             d.set(false, forKey: Key.devLog)
             d.set(1.0, forKey: Key.wheelScrollSpeed)
@@ -313,9 +332,12 @@ final class AppPreferences: ObservableObject {
             ?? HostDisplayPolicy.automatic.rawValue
         hostDisplayPolicy = HostDisplayPolicy(rawValue: hostPolicyRaw) ?? .automatic
         selectedDisplayIdentity = d.string(forKey: Key.selectedDisplayIdentity) ?? ""
-        let storedBitrate = d.object(forKey: Key.videoBitrate) as? Int ?? VideoQualityPreset.default.rawValue
-        videoBitrate = VideoQualityPreset(rawValue: storedBitrate)?.rawValue
-            ?? VideoQualityPreset.default.rawValue
+        if let data = d.data(forKey: Key.videoQuality),
+           let quality = try? JSONDecoder().decode(VideoQualitySettings.self, from: data) {
+            videoQuality = quality
+        } else {
+            videoQuality = .default
+        }
         videoFPS = d.object(forKey: Key.videoFPS) as? Int ?? VideoFPSPreset.default.rawValue
         let priorityRaw = d.string(forKey: Key.videoAdaptationPriority)
             ?? VideoAdaptationPriority.qualityFirst.rawValue
@@ -323,7 +345,6 @@ final class AppPreferences: ObservableObject {
         let audioDestinationRaw = d.string(forKey: Key.audioPlaybackDestination)
             ?? AudioPlaybackDestination.both.rawValue
         audioPlaybackDestination = AudioPlaybackDestination(rawValue: audioDestinationRaw) ?? .both
-        asyncEncoding = d.object(forKey: Key.asyncEncoding) as? Bool ?? true
         let tlsRaw = d.string(forKey: Key.tlsVersionMode) ?? TLSVersionMode.tls12.rawValue
         tlsVersionMode = TLSVersionMode(rawValue: tlsRaw) ?? .tls12
         devLog = d.object(forKey: Key.devLog) as? Bool ?? false
@@ -348,7 +369,6 @@ final class AppPreferences: ObservableObject {
         d.set(preventSystemSleep, forKey: Key.preventSystemSleep)
         d.set(preventDisplaySleep, forKey: Key.preventDisplaySleep)
         d.set(keepScreenUnlockedWhileConnected, forKey: Key.keepScreenUnlockedWhileConnected)
-
         RDPLog.verbose = devLog
         L10n.setLanguage(appLanguage)
         MouseHandler.scrollSpeed = wheelScrollSpeed
@@ -383,9 +403,8 @@ final class AppPreferences: ObservableObject {
             audioPlaybackDestination: audioPlaybackDestination,
             displayMode: displayMode,
             idleTimeout: idleTimeout,
-            videoBitrate: ServerConfig.normalizedVideoBitrate(videoBitrate),
+            videoQuality: videoQuality,
             tlsVersionMode: tlsVersionMode,
-            asyncEncoding: asyncEncoding,
             selectedDisplayIdentity: selectedDisplayIdentity,
             hostDisplayPolicy: hostDisplayPolicy,
             remotePointerScale: remotePointerScale,

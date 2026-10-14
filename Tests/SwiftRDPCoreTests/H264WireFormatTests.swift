@@ -12,15 +12,14 @@ final class H264WireFormatTests: XCTestCase {
     func testDiagnosticAVC420RangeSamples() throws {
         for value in [0, 16, 64, 128, 192, 235, 255] {
             let encoder = H264Encoder()
-            encoder.asyncMode = false
             try encoder.start(width: 64, height: 64)
             defer { encoder.stop() }
-            let encoded = try XCTUnwrap(
-                encoder.encode(pixelBuffer: try makeNV12(
+            let encoded = try encode(
+                encoder, pixelBuffer: try makeNV12(
                     width: 64, height: 64,
                     pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                     luma: UInt8(value)
-                ))
+                )
             )
             try Data(encoded.bytes).write(
                 to: URL(fileURLWithPath: "/tmp/swiftrdp-range-\(value).h264")
@@ -30,12 +29,11 @@ final class H264WireFormatTests: XCTestCase {
 
     func testAVC420IDRCarriesSPSAndCodesAtTheVisibleSize() throws {
         let encoder = H264Encoder()
-        encoder.asyncMode = false
         try encoder.start(width: 320, height: 180)
         defer { encoder.stop() }
 
         let buffer = try makeBGRA(width: 320, height: 180)
-        let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: buffer))
+        let encoded = try encode(encoder, pixelBuffer: buffer)
         let types = nalTypes(in: encoded.bytes)
         XCTAssertTrue(encoded.isIDR)
         XCTAssertTrue(types.contains(5), "expected IDR, got \(types)")
@@ -53,19 +51,17 @@ final class H264WireFormatTests: XCTestCase {
 
     func testAVC420UsesHighProfile() throws {
         let encoder = H264Encoder()
-        encoder.asyncMode = false
         try encoder.start(width: 320, height: 192)
         defer { encoder.stop() }
 
         let buffer = try makeBGRA(width: 320, height: 192)
-        let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: buffer))
+        let encoded = try encode(encoder, pixelBuffer: buffer)
         let profile = try XCTUnwrap(spsProfile(in: encoded.bytes))
         XCTAssertEqual(profile, 100)
     }
 
     func testEncoderEmitsOnlyExplicitIDRs() throws {
         let encoder = H264Encoder()
-        encoder.asyncMode = false
         encoder.expectedFrameRate = 30
         try encoder.start(width: 64, height: 64)
         defer { encoder.stop() }
@@ -73,13 +69,13 @@ final class H264WireFormatTests: XCTestCase {
         let buffer = try makeBGRA(width: 64, height: 64)
         var idrCount = 0
         for _ in 0..<40 {
-            let encoded = try XCTUnwrap(encoder.encode(pixelBuffer: buffer))
+            let encoded = try encode(encoder, pixelBuffer: buffer)
             if encoded.isIDR { idrCount += 1 }
         }
         XCTAssertEqual(idrCount, 1)
 
         encoder.requestForceKeyframe()
-        let forced = try XCTUnwrap(encoder.encode(pixelBuffer: buffer))
+        let forced = try encode(encoder, pixelBuffer: buffer)
         XCTAssertTrue(forced.isIDR)
     }
 
@@ -131,10 +127,23 @@ final class H264WireFormatTests: XCTestCase {
 
     private func encodeAVC420(pixelFormat: OSType) throws -> H264Encoder.EncodedAccessUnit {
         let encoder = H264Encoder()
-        encoder.asyncMode = false
         try encoder.start(width: 64, height: 64)
         defer { encoder.stop() }
-        return try XCTUnwrap(encoder.encode(pixelBuffer: try makeNV12(width: 64, height: 64, pixelFormat: pixelFormat)))
+        return try encode(encoder, pixelBuffer: makeNV12(width: 64, height: 64, pixelFormat: pixelFormat))
+    }
+
+    private func encode(
+        _ encoder: H264Encoder,
+        pixelBuffer: CVPixelBuffer
+    ) throws -> H264Encoder.EncodedAccessUnit {
+        let completed = expectation(description: "VideoToolbox output")
+        var output: Result<H264Encoder.EncodedAccessUnit, H264Encoder.EncodeError>?
+        XCTAssertTrue(encoder.encodeAsync(pixelBuffer: pixelBuffer) { result in
+            output = result
+            completed.fulfill()
+        })
+        wait(for: [completed], timeout: 2)
+        return try XCTUnwrap(output).get()
     }
 
     private func makeNV12(

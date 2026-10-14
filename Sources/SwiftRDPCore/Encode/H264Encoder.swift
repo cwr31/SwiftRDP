@@ -9,9 +9,21 @@ import CoreVideo
 /// single Annex-B access unit containing only the NAL types accepted by the
 /// RDP graphics wire format.
 public final class H264Encoder {
+    public static let maxFramesInFlight = 2
+
+    public struct OutputTiming: Sendable {
+        public let latencyMs: Double
+        /// Valid only when there was uninterrupted outstanding encoder work.
+        public let busyIntervalMs: Double?
+        public let backlogged: Bool
+    }
+
     public struct EncodedAccessUnit {
         public let bytes: [UInt8]
         public let isIDR: Bool
+        /// Native NV12 sample-weighted reconstruction error, not an inferred QP.
+        public let meanSquaredError: Double?
+        public let timing: OutputTiming
     }
 
     public enum EncodeError: Error {
@@ -25,17 +37,26 @@ public final class H264Encoder {
     private final class PendingFrame {
         let generation: UInt64
         let deadline: DispatchTime
+        let submittedAt: UInt64
+        var completedAt: UInt64?
         let completion: (Result<EncodedAccessUnit, EncodeError>) -> Void
 
         init(
             generation: UInt64,
             deadline: DispatchTime,
+            submittedAt: UInt64,
             completion: @escaping (Result<EncodedAccessUnit, EncodeError>) -> Void
         ) {
             self.generation = generation
             self.deadline = deadline
+            self.submittedAt = submittedAt
             self.completion = completion
         }
+    }
+
+    private struct Completion {
+        let frame: PendingFrame
+        let result: Result<EncodedAccessUnit, EncodeError>
     }
 
     private var session: VTCompressionSession?
@@ -53,6 +74,9 @@ public final class H264Encoder {
 
     private var pendingForceKeyframe = false
     private var pending: [Int64: PendingFrame] = [:]
+    private var outputOrder = OrderedFrameOutput<Completion>(capacity: H264Encoder.maxFramesInFlight)
+    private var lastCompletedAt: UInt64?
+    private var lastCompletionHadWork = false
     private var sweepScheduled = false
     private var generation: UInt64 = 0
     private var idrCount = 0
@@ -66,12 +90,11 @@ public final class H264Encoder {
     private static let sweepInterval: TimeInterval = 0.25
     public var bitrate: Int = 12_500_000
     public var expectedFrameRate: Int = 30
-    public var asyncMode = true
 
     var hasPendingFrames: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !pending.isEmpty
+        return !outputOrder.isEmpty
     }
 
     public init() {}
@@ -97,9 +120,9 @@ public final class H264Encoder {
         loggedRateControlSupport = false
         session = try makeSession(width: self.width, height: self.height)
         RDPLog.gfx.info("H264: AVC420 VideoToolbox zero-copy (NV12/BGRA -> VT)")
-        RDPLog.gfx.info(
+        RDPLog.gfx.notice(
             "H264: encoder initialized \(self.width)x\(self.height) " +
-            "visible=\(visibleWidth)x\(visibleHeight)"
+            "visible=\(visibleWidth)x\(visibleHeight) pipeline=\(Self.maxFramesInFlight)"
         )
     }
 
@@ -111,6 +134,9 @@ public final class H264Encoder {
         let oldSession = session
         session = nil
         pending.removeAll(keepingCapacity: true)
+        outputOrder.reset()
+        lastCompletedAt = nil
+        lastCompletionHadWork = false
         pendingForceKeyframe = false
         sweepScheduled = false
         lock.unlock()
@@ -174,43 +200,17 @@ public final class H264Encoder {
     @discardableResult
     public func encodeAsync(
         pixelBuffer: CVPixelBuffer,
+        refinement: Bool = false,
         completion: @escaping (Result<EncodedAccessUnit, EncodeError>) -> Void
     ) -> Bool {
-        submit(pixelBuffer: pixelBuffer, completion: completion) != nil
-    }
-
-    public func encode(pixelBuffer: CVPixelBuffer) -> EncodedAccessUnit? {
-        var encoded: EncodedAccessUnit?
-        let done = DispatchSemaphore(value: 0)
-        let submitted = submit(pixelBuffer: pixelBuffer) { result in
-            switch result {
-            case .success(let unit):
-                encoded = unit
-            case .failure(let error):
-                RDPLog.gfx.error("H264: encode failed (\(error))")
-            }
-            done.signal()
-        }
-        guard let pts = submitted else { return nil }
-        completeFrames(untilPresentationTimeStamp: pts)
-        guard done.wait(timeout: .now() + Self.frameTimeout + Self.sweepInterval * 2) == .success else {
-            RDPLog.gfx.error("H264: encode delivery stalled \(width)x\(height)")
-            return nil
-        }
-        return encoded
-    }
-
-    private func submit(
-        pixelBuffer: CVPixelBuffer,
-        completion: @escaping (Result<EncodedAccessUnit, EncodeError>) -> Void
-    ) -> CMTime? {
         submissionLock.lock()
         defer { submissionLock.unlock() }
 
         lock.lock()
-        guard let session, pending.isEmpty else {
+        guard let session, outputOrder.count < Self.maxFramesInFlight,
+              !pendingForceKeyframe || outputOrder.isEmpty else {
             lock.unlock()
-            return nil
+            return false
         }
         let force = consumeForceKeyframeLocked()
         let now = DispatchTime.now().uptimeNanoseconds
@@ -220,11 +220,18 @@ public final class H264Encoder {
         let value = max(elapsed, lastPresentationNanoseconds + 1)
         lastPresentationNanoseconds = value
         let pts = CMTime(value: value, timescale: Self.ptsTimescale)
+        // Ordinary pictures keep their cadence budget despite delivery gaps.
+        // Bounded static refreshes explicitly spend up to 200 ms of the same
+        // adaptive bitrate budget; native rate control remains enabled.
+        let pictureRate = refinement ? 5 : encoderPictureRate
+        let duration = CMTime(value: 1, timescale: CMTimeScale(pictureRate))
         let key = pts.value
         let submissionGeneration = generation
+        guard outputOrder.reserve(key) else { lock.unlock(); return false }
         pending[key] = PendingFrame(
             generation: submissionGeneration,
             deadline: .now() + Self.frameTimeout,
+            submittedAt: now,
             completion: completion
         )
         scheduleSweepLocked()
@@ -238,11 +245,13 @@ public final class H264Encoder {
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: pts,
-            duration: .invalid,
+            duration: duration,
             frameProperties: properties,
             infoFlagsOut: &encodeInfoFlags
         ) { [weak self] status, infoFlags, sampleBuffer in
-            guard let self else { return }
+            guard let self,
+                  let timing = self.recordCompletionTiming(key: key, generation: submissionGeneration)
+            else { return }
             if Self.isFrameDropped(infoFlags) {
                 RDPLog.gfx.debug(
                     "H264: frame dropped status=\(status) " +
@@ -289,12 +298,14 @@ public final class H264Encoder {
                 )
                 return
             }
-            self.deliver(key: key, generation: submissionGeneration, unit: unit)
+            self.complete(key: key, generation: submissionGeneration,
+                result: .success(EncodedAccessUnit(bytes: unit.bytes, isIDR: unit.isIDR,
+                    meanSquaredError: Self.meanSquaredError(sampleBuffer), timing: timing)))
         }
         guard status == noErr else {
             RDPLog.gfx.error("H264: submission failed: \(status)")
-            dropPending(key: key, generation: submissionGeneration)
-            return nil
+            finish(key: key, generation: submissionGeneration, failure: .frameFailed(status))
+            return true
         }
         if Self.isFrameDropped(encodeInfoFlags) {
             RDPLog.gfx.debug(
@@ -303,81 +314,85 @@ public final class H264Encoder {
             )
             finish(key: key, generation: submissionGeneration, failure: .frameDropped)
         }
-        return pts
+        return true
     }
 
-    private func deliver(key: Int64, generation: UInt64, unit: EncodedAccessUnit) {
+    private func recordCompletionTiming(key: Int64, generation: UInt64) -> OutputTiming? {
         lock.lock()
-        guard self.generation == generation, let frame = pending.removeValue(forKey: key) else {
-            lock.unlock()
-            return
+        defer { lock.unlock() }
+        guard self.generation == generation, let frame = pending[key], frame.completedAt == nil else { return nil }
+        let now = DispatchTime.now().uptimeNanoseconds
+        frame.completedAt = now
+        let backlogged = pending.values.contains { $0.completedAt == nil }
+        let interval: Double?
+        if let previous = lastCompletedAt, now > previous,
+           lastCompletionHadWork, frame.submittedAt <= previous {
+            interval = Double(now - previous) / 1_000_000
+        } else {
+            interval = nil
         }
-        lock.unlock()
-        deliveryQueue.async { frame.completion(.success(unit)) }
-    }
-
-    private func dropPending(key: Int64, generation: UInt64) {
-        lock.lock()
-        if self.generation == generation, pending.removeValue(forKey: key) != nil {
-            pendingForceKeyframe = true
-        }
-        lock.unlock()
+        lastCompletedAt = now
+        lastCompletionHadWork = backlogged
+        return OutputTiming(latencyMs: Double(now - frame.submittedAt) / 1_000_000,
+            busyIntervalMs: interval, backlogged: backlogged)
     }
 
     private func finish(key: Int64, generation: UInt64, failure: EncodeError) {
+        complete(key: key, generation: generation, result: .failure(failure))
+    }
+
+    private func complete(key: Int64, generation: UInt64, result: Result<EncodedAccessUnit, EncodeError>) {
         lock.lock()
+        defer { lock.unlock() }
         guard self.generation == generation, let frame = pending.removeValue(forKey: key) else {
-            lock.unlock()
             return
         }
         // A dropped input never reached the client and does not invalidate the
         // encoder's last emitted reference frame. Other failures need a fresh
         // reference chain before the next picture is sent.
-        if case .frameDropped = failure {
-            // Keep the current reference chain.
-        } else {
-            pendingForceKeyframe = true
+        if case .failure(let failure) = result {
+            switch failure {
+            case .frameDropped: break
+            default: pendingForceKeyframe = true
+            }
         }
-        lock.unlock()
-        deliveryQueue.async { frame.completion(.failure(failure)) }
+        for completed in outputOrder.complete(key, with: Completion(frame: frame, result: result)) {
+            // Enqueue under the state lock so concurrent VT callbacks cannot
+            // race the submission-ordered delivery sequence.
+            deliveryQueue.async { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let current = self.generation == generation
+                self.lock.unlock()
+                if current { completed.frame.completion(completed.result) }
+            }
+        }
     }
 
     private func scheduleSweepLocked() {
         guard !sweepScheduled, !pending.isEmpty else { return }
         sweepScheduled = true
+        let sweepGeneration = generation
         deliveryQueue.asyncAfter(deadline: .now() + Self.sweepInterval) { [weak self] in
-            self?.sweepExpired()
+            self?.sweepExpired(generation: sweepGeneration)
         }
     }
 
-    private func sweepExpired() {
+    private func sweepExpired(generation expectedGeneration: UInt64) {
         let now = DispatchTime.now()
-        var expired: [PendingFrame] = []
+        var expired: [Int64] = []
         lock.lock()
+        guard generation == expectedGeneration else { lock.unlock(); return }
         sweepScheduled = false
         for (key, frame) in pending where frame.deadline < now {
-            pending.removeValue(forKey: key)
-            expired.append(frame)
-            pendingForceKeyframe = true
+            expired.append(key)
         }
+        let expiredGeneration = generation
+        lock.unlock()
+        for key in expired { finish(key: key, generation: expiredGeneration, failure: .timedOut) }
+        lock.lock()
         scheduleSweepLocked()
         lock.unlock()
-        for frame in expired { frame.completion(.failure(.timedOut)) }
-    }
-
-    private func completeFrames(untilPresentationTimeStamp pts: CMTime) {
-        lock.lock()
-        let currentSession = session
-        lock.unlock()
-        if let currentSession {
-            let status = VTCompressionSessionCompleteFrames(
-                currentSession,
-                untilPresentationTimeStamp: pts
-            )
-            if status != noErr {
-                RDPLog.gfx.error("H264: CompleteFrames failed: \(status)")
-            }
-        }
     }
 
     private func consumeForceKeyframeLocked() -> Bool {
@@ -399,9 +414,12 @@ public final class H264Encoder {
         )
 
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        let qualityStatus = VTSessionSetProperty(sess,
+            key: kVTCompressionPropertyKey_CalculateMeanSquaredError, value: kCFBooleanTrue)
+        if qualityStatus != noErr {
+            RDPLog.gfx.notice("H264: native quality metrics unavailable (\(qualityStatus)); static refinement disabled")
+        }
         VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_AllowOpenGOP, value: kCFBooleanFalse)
-        VTSessionSetProperty(sess, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         VTSessionSetProperty(
             sess,
             key: kVTCompressionPropertyKey_AllowTemporalCompression,
@@ -436,11 +454,6 @@ public final class H264Encoder {
             sess,
             key: kVTCompressionPropertyKey_YCbCrMatrix,
             value: kCVImageBufferYCbCrMatrix_ITU_R_709_2
-        )
-        VTSessionSetProperty(
-            sess,
-            key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
-            value: kCFBooleanTrue
         )
         let profileLabel = applyHighProfile(sess)
 
@@ -568,7 +581,7 @@ public final class H264Encoder {
 
     private static let startCode: [UInt8] = [0, 0, 0, 1]
 
-    private static func makeAccessUnit(_ sampleBuffer: CMSampleBuffer) -> EncodedAccessUnit? {
+    private static func makeAccessUnit(_ sampleBuffer: CMSampleBuffer) -> (bytes: [UInt8], isIDR: Bool)? {
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
         let isIDR = isSyncSample(sampleBuffer)
         var lengthFieldSize = 4
@@ -605,7 +618,7 @@ public final class H264Encoder {
         }
         guard (1...4).contains(lengthFieldSize) else { return nil }
 
-        return withAVCCBytes(dataBuffer) { source, total -> EncodedAccessUnit? in
+        return withAVCCBytes(dataBuffer) { source, total -> (bytes: [UInt8], isIDR: Bool)? in
             let bytes = annexBAccessUnit(
                 avcc: source,
                 length: total,
@@ -613,7 +626,7 @@ public final class H264Encoder {
                 parameterSets: parameterSets
             )
             guard !bytes.isEmpty else { return nil }
-            return EncodedAccessUnit(bytes: bytes, isIDR: isIDR)
+            return (bytes: bytes, isIDR: isIDR)
         }
     }
 
@@ -693,5 +706,16 @@ public final class H264Encoder {
             return true
         }
         return first[kCMSampleAttachmentKey_NotSync] as? Bool != true
+    }
+
+    private static func meanSquaredError(_ sampleBuffer: CMSampleBuffer) -> Double? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+            let metrics = attachments.first?[kVTSampleAttachmentKey_QualityMetrics] as? [CFString: Any],
+            let y = metrics[kVTSampleAttachmentQualityMetricsKey_LumaMeanSquaredError] as? Double,
+            let cb = metrics[kVTSampleAttachmentQualityMetricsKey_ChromaBlueMeanSquaredError] as? Double,
+            let cr = metrics[kVTSampleAttachmentQualityMetricsKey_ChromaRedMeanSquaredError] as? Double,
+            y.isFinite, cb.isFinite, cr.isFinite, y >= 0, cb >= 0, cr >= 0 else { return nil }
+        return (4 * y + cb + cr) / 6
     }
 }

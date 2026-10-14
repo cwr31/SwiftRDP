@@ -142,16 +142,6 @@ extension RemoteFXEncoder {
         return out
     }
 
-    /// Next stage after a successful send of `from`.
-    public static func nextStage(after from: TileQualityStage) -> TileQualityStage? {
-        switch from {
-        case .none: return .coarse
-        case .coarse: return .mid
-        case .mid: return .full
-        case .full: return nil
-        }
-    }
-
     /// Build ops for pending first-paint and upgrade keys.
     public static func makeTileOps(
         tilesByKey: [UInt64: Tile],

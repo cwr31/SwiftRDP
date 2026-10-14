@@ -4,16 +4,93 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class GFXPipelineTests: XCTestCase {
+    func testPipelineStateChangesAreDeliveredAfterSetupAndStop() throws {
+        let pipeline = GFXPipeline()
+        defer { pipeline.onStateChanged = nil; pipeline.stop() }
+        attach(pipeline) { _ in }
+        let ready = expectation(description: "Graphics ready")
+        pipeline.onStateChanged = {
+            XCTAssertTrue(pipeline.isPipelineReady)
+            ready.fulfill()
+        }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        wait(for: [ready], timeout: 2)
+
+        let stopped = expectation(description: "Graphics stopped")
+        pipeline.onStateChanged = {
+            XCTAssertFalse(pipeline.isPipelineReady)
+            stopped.fulfill()
+        }
+        pipeline.stop()
+        wait(for: [stopped], timeout: 2)
+    }
+
     private let zgfxDecoder = ZGFXCompressor()
+    private var captureSequence: UInt64 = 0
+
+    private func nextCaptureSequence() -> UInt64 {
+        captureSequence += 1
+        return captureSequence
+    }
+
+    func testAsyncCompletedFrameWaitsForCreditThenDrainsOnACK() throws {
+        let pipeline = GFXPipeline()
+        pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 2)
+        let gateEntered = DispatchSemaphore(value: 0)
+        let releaseGate = DispatchSemaphore(value: 0)
+        let writesLock = NSLock()
+        var videos = 0
+        var gateNextVideo = false
+        pipeline.attach(transport: RDPGFXDynamicChannelTransport { pdus, priority, written in
+            writesLock.lock()
+            let gated = priority == .video && gateNextVideo
+            if priority == .video { videos += 1 }
+            if gated { gateNextVideo = false }
+            writesLock.unlock()
+            if gated {
+                gateEntered.signal()
+                _ = releaseGate.wait(timeout: .now() + 3)
+            }
+            written?(DispatchTime.now().uptimeNanoseconds)
+            return pdus.reduce(0) { $0 + $1.count }
+        })
+        defer { releaseGate.signal(); pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        writesLock.lock(); gateNextVideo = true; writesLock.unlock()
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 20),
+            captureSequence: nextCaptureSequence()), .submitted)
+        XCTAssertEqual(gateEntered.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40),
+            captureSequence: nextCaptureSequence()), .submitted)
+        // A negotiated/live window can tighten while the second picture is encoding.
+        pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 1)
+        XCTAssertEqual(pipeline.currentFrameAcknowledgementWindow, 1)
+        releaseGate.signal()
+        let queued = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            pipeline.queuedEncodedFrameCount == 1
+        }, object: nil)
+        wait(for: [queued], timeout: 2)
+        XCTAssertEqual(pipeline.unackedFrameCount, 1)
+        writesLock.lock(); let beforeACK = videos; writesLock.unlock()
+        XCTAssertEqual(beforeACK, 2)
+        pipeline.handleClientPDU(frameAck(frameId: 2))
+        XCTAssertEqual(pipeline.queuedEncodedFrameCount, 0)
+        XCTAssertEqual(pipeline.unackedFrameCount, 1)
+        writesLock.lock(); let afterACK = videos; writesLock.unlock()
+        XCTAssertEqual(afterACK, 3)
+    }
 
     func testFutureACKCannotClearTrackedFrames() throws {
         let pipeline = GFXPipeline()
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
         pipeline.handleClientPDU(frameAck(frameId: 2))
         XCTAssertEqual(pipeline.unackedFrameCount, 1)
         pipeline.handleClientPDU(frameAck(frameId: 1))
@@ -22,10 +99,9 @@ final class GFXPipelineTests: XCTestCase {
 
     func testOnlyTrackedACKExitsStallRecovery() throws {
         let pipeline = GFXPipeline()
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         pipeline.attachController(controller)
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
@@ -33,21 +109,20 @@ final class GFXPipelineTests: XCTestCase {
         _ = controller.noteBackpressureTimeout(unackedWas: 2)
         pipeline.handleClientPDU(frameAck(frameId: 0))
         XCTAssertTrue(controller.stallRecoveryMode)
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
         pipeline.handleClientPDU(frameAck(frameId: 1))
         XCTAssertFalse(controller.stallRecoveryMode)
     }
 
     func testQoECommandIntervalDoesNotBecomeDecoderPressure() throws {
         let pipeline = GFXPipeline()
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         pipeline.attachController(controller)
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64)), .submitted)
         pipeline.handleClientPDU(qoeFrameAck(frameId: 1, commandDecodeMs: 2000, renderMs: 10))
         XCTAssertEqual(controller.performanceSnapshot().clientRenderMs, 10)
         XCTAssertEqual(controller.performanceSnapshot().clientPressure, 0)
@@ -69,11 +144,277 @@ final class GFXPipelineTests: XCTestCase {
         )
     }
 
+    @discardableResult
+    private func encodeFrameAndWait(
+        _ pipeline: GFXPipeline,
+        pixelBuffer: CVPixelBuffer,
+        sequence: UInt64? = nil
+    ) -> GFXPipeline.FrameSubmission {
+        let completed = DispatchSemaphore(value: 0)
+        let previous = pipeline.onWorkAvailable
+        pipeline.onWorkAvailable = { previous?(); completed.signal() }
+        defer { pipeline.onWorkAvailable = previous }
+        let result = pipeline.encodeFrame(pixelBuffer: pixelBuffer,
+            captureSequence: sequence ?? nextCaptureSequence())
+        if result == .submitted {
+            let deadline = DispatchTime.now() + 2
+            while pipeline.hasPendingEncode {
+                guard completed.wait(timeout: deadline) == .success else {
+                    XCTFail("Graphics output did not complete")
+                    break
+                }
+            }
+        }
+        return result
+    }
+
+    func testRejectedFinalFrameRetriesTheSameCaptureWithAFreshReference() throws {
+        let pipeline = GFXPipeline()
+        let collector = WriteCollector()
+        var rejectNextVideo = false
+        let lock = NSLock()
+        pipeline.attach(transport: RDPGFXDynamicChannelTransport { pdus, priority, written in
+            if lock.withLock({ () -> Bool in
+                guard priority == .video, rejectNextVideo else { return false }
+                rejectNextVideo = false
+                return true
+            }) { return nil }
+            for pdu in pdus { collector.append(pdu) }
+            written?(DispatchTime.now().uptimeNanoseconds)
+            return pdus.reduce(0) { $0 + $1.count }
+        })
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        let setup = collector.count
+        let decoder = H264TestDecoder()
+        XCTAssertEqual(encodeFrameAndWait(pipeline,
+            pixelBuffer: try makePixelBuffer(width: 64, height: 64), sequence: 1), .submitted)
+        let firstWire = try wirePDU(in: collector.snapshot, after: setup)
+        _ = try decoder.decode(Array(firstWire.dropFirst(39)))
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        let final = try makePixelBuffer(width: 64, height: 64, value: 200)
+        let beforeRejection = collector.count
+        lock.withLock { rejectNextVideo = true }
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: final, sequence: 2), .submitted)
+        XCTAssertEqual(collector.count, beforeRejection)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: final, sequence: 2), .submitted)
+        let retryWire = try wirePDU(in: collector.snapshot, after: beforeRejection)
+        XCTAssertTrue(containsAnnexBNAL(type: 5, in: retryWire))
+        let decoded = try decoder.decode(Array(retryWire.dropFirst(39)))
+        XCTAssertGreaterThan(firstLuma(decoded), 150)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: final, sequence: 2), .blocked)
+    }
+
+    func testQuietCaptureAttemptsAtMostOneUsefulReferenceRefreshThenStops() throws {
+        let pipeline = GFXPipeline()
+        let collector = WriteCollector()
+        attach(pipeline) { collector.append($0) }
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        let buffer = try makeDetailedPixelBuffer()
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .blocked)
+        Thread.sleep(forTimeInterval: 0.27)
+        let beforeRefresh = collector.count
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        XCTAssertLessThanOrEqual(collector.count, beforeRefresh + 3)
+        if collector.count > beforeRefresh {
+            let wire = try wirePDU(in: collector.snapshot, after: beforeRefresh)
+            XCTAssertTrue(containsAnnexBNAL(type: 5, in: wire))
+            XCTAssertEqual(collector.count, beforeRefresh + 3)
+            pipeline.handleClientPDU(frameAck(frameId: 2))
+        }
+        Thread.sleep(forTimeInterval: 0.22)
+        for _ in 0..<16 {
+            XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .blocked)
+        }
+        XCTAssertNil(pipeline.nextFrameWaitNanoseconds)
+    }
+
+    func testQualityIncreaseRefreshesStaticContentWithoutOverridingAdaptation() throws {
+        let session = RDPSession(config: ServerConfig(videoQuality: VideoQualitySettings(mode: .high)))
+        let pipeline = session.gfx
+        let collector = WriteCollector()
+        attach(pipeline) { collector.append($0) }
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        let buffer = try makeDetailedPixelBuffer()
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        Thread.sleep(forTimeInterval: 0.27)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 2))
+        XCTAssertNil(pipeline.nextFrameWaitNanoseconds)
+        session.applyVideoQuality(VideoQualitySettings(mode: .original))
+        XCTAssertEqual(session.videoController.targetBitrate, 2_000_000)
+        Thread.sleep(forTimeInterval: 0.22)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+    }
+
+    func testNetworkPressureDefersThePendingStaticRefreshUntilRecovery() throws {
+        let pipeline = GFXPipeline()
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
+        pipeline.attachController(controller)
+        attach(pipeline) { _ in }
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        let buffer = try makeDetailedPixelBuffer()
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        controller.noteServerQueue(bytes: 2_000_000)
+        pipeline.applyLiveControllerCaps()
+        Thread.sleep(forTimeInterval: 0.27)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .blocked)
+        controller.noteServerQueue(bytes: 0)
+        pipeline.applyLiveControllerCaps()
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+    }
+
+    func testOversizedOptionalRefreshNeverRetriesIdleAndNextCaptureStillDecodes() throws {
+        let pipeline = GFXPipeline()
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
+        pipeline.attachController(controller)
+        let collector = WriteCollector()
+        attach(pipeline) { collector.append($0) }
+        defer { pipeline.stop() }
+        try pipeline.start(width: 512, height: 512)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        let buffer = try makePixelBuffer(width: 512, height: 512)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        let pixels = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt32.self)
+        let stride = CVPixelBufferGetBytesPerRow(buffer) / 4
+        for y in 0..<512 {
+            for x in 0..<512 {
+                let r = (x * 17 + y * 31) & 255
+                let g = (x * 53 ^ y * 97) & 255
+                let b = (x * 113 + y * 73) & 255
+                pixels[y * stride + x] = 0xff000000 | UInt32(r << 16 | g << 8 | b)
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        let setup = collector.count
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        let firstWire = try wirePDU(in: collector.snapshot, after: setup)
+        let decoder = H264TestDecoder()
+        _ = try decoder.decode(Array(firstWire.dropFirst(39)))
+        pipeline.handleClientPDU(frameAck(frameId: 1))
+        controller.updateConfiguredBitrate(1_000_000)
+        pipeline.applyLiveControllerCaps()
+        let liveEncoder = pipeline.h264
+        Thread.sleep(forTimeInterval: 0.27)
+        let beforeRefresh = collector.count
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .submitted)
+        XCTAssertEqual(collector.count, beforeRefresh, "an oversized optional IDR must not reach the transport")
+        XCTAssertTrue(pipeline.h264 === liveEncoder)
+        XCTAssertNil(pipeline.nextFrameWaitNanoseconds)
+        for _ in 0..<16 {
+            XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 1), .blocked)
+        }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        for y in 0..<32 {
+            for x in 0..<32 { pixels[y * stride + x] = 0xffc8c8c8 }
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        let latest = buffer
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: latest, sequence: 2), .submitted)
+        let finalWire = try wirePDU(in: collector.snapshot, after: beforeRefresh)
+        XCTAssertFalse(containsAnnexBNAL(type: 5, in: finalWire), "a rejected trial must not force a live IDR")
+        let decoded = try decoder.decode(Array(finalWire.dropFirst(39)))
+        XCTAssertGreaterThan(firstLuma(decoded), 150)
+    }
+
+    func testAcceptedTrialBecomesLiveAndNextUpdateUsesItsPFrameReference() throws {
+        let pipeline = GFXPipeline()
+        pipeline.targetBitrate = 2_000_000
+        let collector = WriteCollector()
+        attach(pipeline) { collector.append($0) }
+        defer { pipeline.stop() }
+        try pipeline.start(width: 512, height: 512)
+        pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
+        let decoder = H264TestDecoder()
+        var latest: CVPixelBuffer?
+        for index in 0..<8 {
+            let buffer = try makeDetailedPixelBuffer(width: 512, height: 512, seed: index)
+            var wired = false
+            for _ in 0..<8 {
+                let before = collector.count
+                _ = encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: UInt64(index + 1))
+                if collector.count > before {
+                    let wire = try wirePDU(in: collector.snapshot, after: before)
+                    _ = try decoder.decode(Array(wire.dropFirst(39)))
+                    let end = unwrap(try XCTUnwrap(collector.snapshot.last))
+                    pipeline.handleClientPDU(frameAck(frameId: readU32(end, at: 8)))
+                    wired = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.04)
+            }
+            XCTAssertTrue(wired)
+            latest = buffer
+            Thread.sleep(forTimeInterval: 1.0 / 30)
+        }
+        let buffer = try XCTUnwrap(latest)
+        let original = pipeline.h264
+        pipeline.targetBitrate = 20_000_000
+        pipeline.h264.updateBitrate(20_000_000)
+        pipeline.requestStaticRefinement()
+        Thread.sleep(forTimeInterval: 0.27)
+        let beforeTrial = collector.count
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 8), .submitted)
+        XCTAssertFalse(pipeline.h264 === original)
+        let trialWire = try wirePDU(in: collector.snapshot, after: beforeTrial)
+        XCTAssertTrue(containsAnnexBNAL(type: 5, in: trialWire))
+        _ = try decoder.decode(Array(trialWire.dropFirst(39)))
+        let end = unwrap(try XCTUnwrap(collector.snapshot.last))
+        pipeline.handleClientPDU(frameAck(frameId: readU32(end, at: 8)))
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        let pixels = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt32.self)
+        let stride = CVPixelBufferGetBytesPerRow(buffer) / 4
+        for y in 0..<32 {
+            for x in 0..<32 { pixels[y * stride + x] = 0xffc8c8c8 }
+        }
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        let beforeUpdate = collector.count
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer, sequence: 9), .submitted)
+        let updateWire = try wirePDU(in: collector.snapshot, after: beforeUpdate)
+        XCTAssertFalse(containsAnnexBNAL(type: 5, in: updateWire))
+        let decoded = try decoder.decode(Array(updateWire.dropFirst(39)))
+        XCTAssertGreaterThan(firstLuma(decoded), 150)
+    }
+
+    private func firstLuma(_ buffer: CVPixelBuffer) -> UInt8 {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        return CVPixelBufferGetBaseAddressOfPlane(buffer, 0)!.load(as: UInt8.self)
+    }
+
+    private func makeDetailedPixelBuffer(width: Int = 64, height: Int = 64,
+                                        seed: Int = 0) throws -> CVPixelBuffer {
+        let buffer = try makePixelBuffer(width: width, height: height)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let pixels = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt32.self)
+        let stride = CVPixelBufferGetBytesPerRow(buffer) / 4
+        for y in 0..<height {
+            for x in 0..<width {
+                let value = UInt32(((x * 17 + y * 29 + seed * 47) ^ ((x / 3 + y / 5) * 37)) & 255)
+                pixels[y * stride + x] = 0xff000000 | value * 0x010101
+            }
+        }
+        return buffer
+    }
+
     func testAVC106EncodesDesktopSizeOneToOne() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 1920, height: 1200)
@@ -83,7 +424,7 @@ final class GFXPipelineTests: XCTestCase {
         // RESET, CAPS_CONFIRM, CREATE, MAP (unscaled)
         XCTAssertEqual(commands, [0x0013, 0x000E, 0x0009, 0x000F])
         let create = unwrap(writes[2])
-        // Encode 1:1 at desktop size (only align down to 16).
+        // Surface and encoder both use the negotiated desktop size.
         XCTAssertEqual(readU16(create, at: 10), 1920)
         XCTAssertEqual(readU16(create, at: 12), 1200)
         XCTAssertEqual(pipeline.surfaceEncodeSize.width, 1920)
@@ -96,7 +437,6 @@ final class GFXPipelineTests: XCTestCase {
         let pipeline = GFXPipeline()
         let collector = WriteCollector()
         attach(pipeline) { collector.append($0) }
-        pipeline.asyncEncoding = true
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -104,13 +444,12 @@ final class GFXPipelineTests: XCTestCase {
         let setupWriteCount = collector.count
         let buffer = try makePixelBuffer(width: 64, height: 64)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer, captureSequence: 1), .submitted)
         pipeline.requestForceIDR(reason: "refresh during bootstrap")
         _ = try waitForWrites(collector, count: setupWriteCount + 3)
-        XCTAssertTrue(pipeline.hasPendingForcedFrame)
 
         pipeline.handleClientPDU(frameAck(frameId: 1))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer, captureSequence: 1), .submitted)
         let writes = try waitForWrites(collector, count: setupWriteCount + 6)
         let wire = unwrap(writes[setupWriteCount + 4])
         XCTAssertTrue(containsAnnexBNAL(type: 5, in: wire))
@@ -118,11 +457,11 @@ final class GFXPipelineTests: XCTestCase {
 
     func testBootstrapUsesNegotiatedFrameWindowAndKeepsPFrameChain() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
         // Keep the window small so two H.264 frames (plus bootstrap probe) saturate it.
         pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 2)
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -133,19 +472,19 @@ final class GFXPipelineTests: XCTestCase {
         let third = try makePixelBuffer(width: 64, height: 64, value: 40)
         let fourth = try makePixelBuffer(width: 64, height: 64, value: 60)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: first), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: first), .submitted)
         XCTAssertEqual(writes.count, setupWriteCount + 3)
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: second), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: second), .submitted)
         XCTAssertEqual(writes.count, setupWriteCount + 6)
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: third), .blocked)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: third), .blocked)
         XCTAssertEqual(writes.count, setupWriteCount + 6)
 
         pipeline.handleClientPDU(frameAck(frameId: 1))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: third), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: third), .submitted)
         XCTAssertEqual(writes.count, setupWriteCount + 9)
 
         pipeline.handleClientPDU(frameAck(frameId: 2))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: fourth), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: fourth), .submitted)
         XCTAssertEqual(writes.count, setupWriteCount + 12)
 
         let wire = unwrap(writes[writes.count - 2])
@@ -162,7 +501,6 @@ final class GFXPipelineTests: XCTestCase {
         pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 8)
         pipeline.setAudioLowLatencyMode(true)
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -171,12 +509,12 @@ final class GFXPipelineTests: XCTestCase {
 
         for value: UInt8 in [0, 20] {
             XCTAssertEqual(
-                pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: value)),
+                encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: value)),
                 .submitted
             )
         }
         XCTAssertEqual(
-            pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40)),
+            encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40)),
             .blocked
         )
     }
@@ -187,7 +525,6 @@ final class GFXPipelineTests: XCTestCase {
         pipeline.setAudioLowLatencyMode(true)
         pipeline.setAudioQueuePressure(true)
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -195,31 +532,31 @@ final class GFXPipelineTests: XCTestCase {
         XCTAssertEqual(pipeline.currentFrameAcknowledgementWindow, 2)
 
         XCTAssertEqual(
-            pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 0)),
+            encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 0)),
             .submitted
         )
         XCTAssertEqual(
-            pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 20)),
+            encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 20)),
             .submitted
         )
         XCTAssertEqual(
-            pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40)),
+            encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40)),
             .blocked
         )
 
         pipeline.handleClientPDU(frameAck(frameId: 1))
         XCTAssertEqual(
-            pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40)),
+            encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 40)),
             .submitted
         )
     }
 
     func testSteadyStateWaitsForFrameAckBeforeNextFrame() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
         pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 1)
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -229,12 +566,12 @@ final class GFXPipelineTests: XCTestCase {
         let second = try makePixelBuffer(width: 64, height: 64, value: 20)
         let third = try makePixelBuffer(width: 64, height: 64, value: 40)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: first), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: first), .submitted)
         pipeline.handleClientPDU(frameAck(frameId: 1))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: second), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: second), .submitted)
         XCTAssertEqual(writes.count, setupWriteCount + 6)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: third), .blocked)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: third), .blocked)
         XCTAssertEqual(
             writes.count,
             setupWriteCount + 6,
@@ -242,7 +579,7 @@ final class GFXPipelineTests: XCTestCase {
         )
 
         pipeline.handleClientPDU(frameAck(frameId: 2))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: third), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: third), .submitted)
         XCTAssertEqual(writes.count, setupWriteCount + 9)
     }
 
@@ -250,8 +587,7 @@ final class GFXPipelineTests: XCTestCase {
         let pipeline = GFXPipeline()
         pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 8)
         attach(pipeline) { _ in }
-        pipeline.attachController(VideoTargetController(bitrate: 12_500_000, fps: 30))
-        pipeline.asyncEncoding = false
+        pipeline.attachController(makeMeasuredVideoController(bitrate: 12_500_000, fps: 30))
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -264,12 +600,11 @@ final class GFXPipelineTests: XCTestCase {
         let pipeline = GFXPipeline()
         pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 1)
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
-        pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64))
+        encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64))
         XCTAssertEqual(pipeline.unackedFrameCount, 1)
 
         pipeline.handleClientPDU(qoeFrameAck(frameId: 1, commandDecodeMs: 4, renderMs: 6))
@@ -280,21 +615,20 @@ final class GFXPipelineTests: XCTestCase {
 
     func testFrameAckQueueMapsUnavailableAndQueuedStates() throws {
         let pipeline = GFXPipeline()
-        let controller = VideoTargetController(bitrate: 8_000_000, fps: 30)
+        let controller = makeMeasuredVideoController(bitrate: 8_000_000, fps: 30)
         attach(pipeline) { _ in }
         pipeline.attachController(controller)
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
         let buffer = try makePixelBuffer(width: 64, height: 64)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer), .submitted)
         pipeline.handleClientPDU(frameAck(frameId: 1, clientQueueBytes: 0))
         XCTAssertEqual(controller.clientQueueFeedback, .unavailable)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer), .submitted)
         pipeline.handleClientPDU(frameAck(frameId: 2, clientQueueBytes: 12_345))
         XCTAssertEqual(controller.clientQueueFeedback, .queued(bytes: 12_345))
     }
@@ -302,12 +636,12 @@ final class GFXPipelineTests: XCTestCase {
     func testTCPSendStallOnlyPausesEncode() {
         let pipeline = GFXPipeline()
         attach(pipeline) { _ in }
-        pipeline.attachController(VideoTargetController(bitrate: 12_500_000, fps: 30))
+        pipeline.attachController(makeMeasuredVideoController(bitrate: 12_500_000, fps: 30))
         defer { pipeline.stop() }
 
         pipeline.setSendBlocked(true)
         XCTAssertEqual(
-            pipeline.encodeFrame(pixelBuffer: try! makePixelBuffer(width: 64, height: 64)),
+            pipeline.encodeFrame(pixelBuffer: try! makePixelBuffer(width: 64, height: 64), captureSequence: 1),
             .blocked
         )
         pipeline.setSendBlocked(false)
@@ -316,11 +650,11 @@ final class GFXPipelineTests: XCTestCase {
 
     func testSuspendFrameAcknowledgementsClearsWindowAndAllowsContinuousOutput() throws {
         let pipeline = GFXPipeline()
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
-        var writes: [[UInt8]] = []
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
         pipeline.attachController(controller)
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -328,7 +662,7 @@ final class GFXPipelineTests: XCTestCase {
         let setupWriteCount = writes.count
         let first = try makePixelBuffer(width: 64, height: 64, value: 0)
 
-        pipeline.encodeFrame(pixelBuffer: first)
+        encodeFrameAndWait(pipeline, pixelBuffer: first)
         XCTAssertEqual(writes.count, setupWriteCount + 3)
 
         pipeline.handleClientPDU(frameAck(frameId: 1, clientQueueBytes: UInt32.max))
@@ -338,7 +672,7 @@ final class GFXPipelineTests: XCTestCase {
         XCTAssertEqual(controller.targetBitrate, 20_000_000)
 
         for value: UInt8 in [20, 40, 60] {
-            pipeline.encodeFrame(
+            encodeFrameAndWait(pipeline,
                 pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: value)
             )
         }
@@ -346,7 +680,7 @@ final class GFXPipelineTests: XCTestCase {
 
         pipeline.handleClientPDU(frameAck(frameId: 4, clientQueueBytes: 0))
         XCTAssertFalse(pipeline.isFrameAcknowledgementSuspended)
-        pipeline.encodeFrame(
+        encodeFrameAndWait(pipeline,
             pixelBuffer: try makePixelBuffer(width: 64, height: 64, value: 80)
         )
         XCTAssertEqual(writes.count, setupWriteCount + 15)
@@ -354,15 +688,15 @@ final class GFXPipelineTests: XCTestCase {
 
     func testResizeRejectsOldAckAndBootstrapsWithNewIDR() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
         pipeline.configureFrameAcknowledgement(maxUnacknowledgedFrameCount: 1)
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
-        pipeline.encodeFrame(pixelBuffer: try makePixelBuffer(width: 64, height: 64))
+        encodeFrameAndWait(pipeline, pixelBuffer: try makePixelBuffer(width: 64, height: 64))
         XCTAssertEqual(readU32(unwrap(writes[writes.count - 3]), at: 12), 1)
 
         let resizeStart = writes.count
@@ -382,7 +716,7 @@ final class GFXPipelineTests: XCTestCase {
 
         let resizedBuffer = try makePixelBuffer(width: 80, height: 66, value: 0)
         let changedResizedBuffer = try makePixelBuffer(width: 80, height: 66, value: 40)
-        pipeline.encodeFrame(pixelBuffer: resizedBuffer)
+        encodeFrameAndWait(pipeline, pixelBuffer: resizedBuffer)
         let firstResizeStart = unwrap(writes[writes.count - 3])
         let firstResizeWire = unwrap(writes[writes.count - 2])
         XCTAssertEqual(readU16(firstResizeStart, at: 0), 0x000B)
@@ -392,25 +726,25 @@ final class GFXPipelineTests: XCTestCase {
         let firstResizeWriteCount = writes.count
 
         pipeline.handleClientPDU(frameAck(frameId: 1))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: changedResizedBuffer), .blocked)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: changedResizedBuffer), .blocked)
         XCTAssertEqual(writes.count, firstResizeWriteCount)
 
         pipeline.handleClientPDU(frameAck(frameId: 2))
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: changedResizedBuffer), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: changedResizedBuffer), .submitted)
         XCTAssertEqual(writes.count, firstResizeWriteCount + 3)
     }
 
     func testOutputResumeRebuildsSurfaceAndBootstrapsWithNewIDR() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
         let buffer = try makePixelBuffer(width: 64, height: 64, value: 20)
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer), .submitted)
         pipeline.handleClientPDU(frameAck(frameId: 1))
 
         pipeline.pauseSending()
@@ -422,7 +756,7 @@ final class GFXPipelineTests: XCTestCase {
             writes[rebuildStart...].map(unwrap).map { readU16($0, at: 0) },
             [0x000E, 0x0009, 0x000F]
         )
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer), .submitted)
 
         let start = unwrap(writes[writes.count - 3])
         let wire = unwrap(writes[writes.count - 2])
@@ -437,15 +771,15 @@ final class GFXPipelineTests: XCTestCase {
 
     func testRepeatedCapsResetsProtocolWithoutDeletingClientState() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
         let buffer = try makePixelBuffer(width: 64, height: 64)
-        pipeline.encodeFrame(pixelBuffer: buffer)
+        encodeFrameAndWait(pipeline, pixelBuffer: buffer)
         pipeline.handleClientPDU(frameAck(frameId: 1, clientQueueBytes: UInt32.max))
         XCTAssertTrue(pipeline.isFrameAcknowledgementSuspended)
 
@@ -457,7 +791,7 @@ final class GFXPipelineTests: XCTestCase {
         )
         XCTAssertFalse(pipeline.isFrameAcknowledgementSuspended)
 
-        pipeline.encodeFrame(pixelBuffer: buffer)
+        encodeFrameAndWait(pipeline, pixelBuffer: buffer)
         let start = unwrap(writes[writes.count - 3])
         let wire = unwrap(writes[writes.count - 2])
         XCTAssertEqual(readU16(start, at: 0), 0x000B)
@@ -469,7 +803,6 @@ final class GFXPipelineTests: XCTestCase {
     func testSelectsHighestKnownRDP10Capability() throws {
         let pipeline = GFXPipeline()
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -484,20 +817,9 @@ final class GFXPipelineTests: XCTestCase {
         XCTAssertEqual(pipeline.encodingLabel, "H.264 AVC420")
     }
 
-    func testVersion101CapsConfirmUsesSixteenReservedBytes() {
-        let pipeline = GFXPipeline()
-        let pdu = pipeline.buildCapsConfirm(version: 0x000A_0100, flags: 0xFFFF_FFFF)
-
-        XCTAssertEqual(readU32(pdu, at: 4), 32)
-        XCTAssertEqual(readU32(pdu, at: 8), 0x000A_0100)
-        XCTAssertEqual(readU32(pdu, at: 12), 16)
-        XCTAssertEqual(Array(pdu[16..<32]), [UInt8](repeating: 0, count: 16))
-    }
-
     func testSelectsHighestKnownCapabilityWhenUnknownVersionIsAdvertised() throws {
         let pipeline = GFXPipeline()
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -515,9 +837,9 @@ final class GFXPipelineTests: XCTestCase {
 
     func testH264UsesProgressiveWhenHighestSelectedCapabilityDisablesAVC() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -542,9 +864,9 @@ final class GFXPipelineTests: XCTestCase {
 
     func testSelectedCapabilityFlagsOverrideLowerAVCCapability() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 64, height: 64)
@@ -565,7 +887,6 @@ final class GFXPipelineTests: XCTestCase {
     func testThinClientCapabilityWithoutClassicRemoteFXNotifiesCapabilityFailure() throws {
         let pipeline = GFXPipeline()
         attach(pipeline) { _ in }
-        pipeline.asyncEncoding = false
         let failure = expectation(description: "GFX capability rejection")
         pipeline.onCapabilityFailure = { failure.fulfill() }
         defer { pipeline.stop() }
@@ -629,6 +950,25 @@ final class GFXPipelineTests: XCTestCase {
         XCTAssertEqual(pipeline.selectedCapVersion, 0)
     }
 
+    func testCapsConfirmContainsOnlyTheNegotiableVersionAndFlags() throws {
+        let pipeline = GFXPipeline()
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
+        defer { pipeline.stop() }
+        try pipeline.start(width: 64, height: 64)
+        pipeline.handleClientPDU(capsAdvertiseRaw(sets: [
+            (0x000A_0100, [UInt8](repeating: 0, count: 16)),
+            (0x000A_0600, [2, 0, 0, 0]),
+        ]))
+        let confirm = try XCTUnwrap(writes.map(unwrap).first { readU16($0, at: 0) == 0x0013 })
+        XCTAssertEqual(confirm.count, 20)
+        XCTAssertEqual(readU32(confirm, at: 4), 20)
+        XCTAssertEqual(readU32(confirm, at: 8), 0x000A_0600)
+        XCTAssertEqual(readU32(confirm, at: 12), 4)
+        XCTAssertEqual(readU32(confirm, at: 16), 2)
+    }
+
     func testAVC420MetadataCropsPaddedBitstreamToLogicalRegion() {
         let stream = GFXPipeline.buildAVC420BitmapStream(
             regions: [(0, 0, 1920, 1080)],
@@ -671,9 +1011,9 @@ final class GFXPipelineTests: XCTestCase {
 
     func testBootstrapIDRAdvertisesWholeSurfaceRegion() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        var writes: [[UInt8]] { collector.snapshot }
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
 
         try pipeline.start(width: 128, height: 128)
@@ -681,7 +1021,7 @@ final class GFXPipelineTests: XCTestCase {
         let setupWriteCount = writes.count
         let buffer = try makePixelBuffer(width: 128, height: 128)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: buffer), .submitted)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: buffer), .submitted)
 
         let wire = try wirePDU(in: writes, after: setupWriteCount)
         // Destination rect is the whole surface...
@@ -697,54 +1037,59 @@ final class GFXPipelineTests: XCTestCase {
         XCTAssertEqual(readU16(wire, at: 35), 128)
     }
 
-    func testLetterboxedBootstrapIDRUsesFullOutputSurface() throws {
+    func testStaleCaptureGeometryDoesNotConsumeEncodeCreditOrBootstrap() throws {
         let pipeline = GFXPipeline()
-        var writes: [[UInt8]] = []
-        attach(pipeline) { writes.append($0) }
-        pipeline.asyncEncoding = false
+        let collector = WriteCollector()
+        attach(pipeline) { collector.append($0) }
         defer { pipeline.stop() }
-
-        try pipeline.start(width: 256, height: 256)
+        try pipeline.start(width: 64, height: 64)
         pipeline.handleClientPDU(capsAdvertise(version: 0x000A_0400))
-        let setupWriteCount = writes.count
-        let source = try makePixelBuffer(width: 128, height: 64, value: 0)
+        let setupWriteCount = collector.count
+        let stale = try makePixelBuffer(width: 128, height: 64)
 
-        XCTAssertEqual(pipeline.encodeFrame(pixelBuffer: source), .submitted)
+        for _ in 0..<16 {
+            XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: stale), .blocked)
+        }
+        XCTAssertEqual(collector.count, setupWriteCount)
+        XCTAssertFalse(pipeline.hasPendingEncode)
+        XCTAssertFalse(pipeline.isEncodeWindowFull)
+        XCTAssertEqual(pipeline.unackedFrameCount, 0)
 
-        let wire = try wirePDU(in: writes, after: setupWriteCount)
-        XCTAssertEqual(readU16(wire, at: 13), 0)
-        XCTAssertEqual(readU16(wire, at: 15), 0)
-        XCTAssertEqual(readU16(wire, at: 17), 256)
-        XCTAssertEqual(readU16(wire, at: 19), 256)
-        XCTAssertEqual(readU32(wire, at: 25), 1)
-        // The source is letterboxed inside the output; an IDR still declares
-        // the complete output surface as its replacement region.
-        XCTAssertEqual(readU16(wire, at: 29), 0)
-        XCTAssertEqual(readU16(wire, at: 31), 0)
-        XCTAssertEqual(readU16(wire, at: 33), 256)
-        XCTAssertEqual(readU16(wire, at: 35), 256)
+        let current = try makePixelBuffer(width: 64, height: 64)
+        XCTAssertEqual(encodeFrameAndWait(pipeline, pixelBuffer: current), .submitted)
+        let wire = try wirePDU(in: collector.snapshot, after: setupWriteCount)
+        XCTAssertEqual(readU16(wire, at: 17), 64)
+        XCTAssertEqual(readU16(wire, at: 19), 64)
+        XCTAssertTrue(containsAnnexBNAL(type: 5, in: wire))
     }
 
-    /// Collects pipeline writes from any thread (async delivery queue).
     private final class WriteCollector {
-        private let lock = NSLock()
+        private let condition = NSCondition()
         private var writes: [[UInt8]] = []
 
         func append(_ write: [UInt8]) {
-            lock.lock()
+            condition.lock()
             writes.append(write)
-            lock.unlock()
+            condition.broadcast()
+            condition.unlock()
         }
 
         var count: Int {
-            lock.lock()
-            defer { lock.unlock() }
+            condition.lock()
+            defer { condition.unlock() }
             return writes.count
         }
 
         var snapshot: [[UInt8]] {
-            lock.lock()
-            defer { lock.unlock() }
+            condition.lock()
+            defer { condition.unlock() }
+            return writes
+        }
+
+        func wait(for count: Int, until deadline: Date) -> [[UInt8]] {
+            condition.lock()
+            defer { condition.unlock() }
+            while writes.count < count, condition.wait(until: deadline) {}
             return writes
         }
     }
@@ -754,11 +1099,7 @@ final class GFXPipelineTests: XCTestCase {
         count: Int,
         timeout: TimeInterval = 2.0
     ) throws -> [[UInt8]] {
-        let deadline = Date().addingTimeInterval(timeout)
-        while collector.count < count, Date() < deadline {
-            usleep(2000)
-        }
-        let writes = collector.snapshot
+        let writes = collector.wait(for: count, until: Date().addingTimeInterval(timeout))
         XCTAssertGreaterThanOrEqual(writes.count, count)
         return writes
     }
@@ -842,68 +1183,6 @@ final class GFXPipelineTests: XCTestCase {
                 pixels[offset + 1] = value
                 pixels[offset + 2] = value
                 pixels[offset + 3] = 255
-            }
-        }
-        return buffer
-    }
-
-    private func setBGRA(
-        _ buffer: CVPixelBuffer,
-        x: Int,
-        y: Int,
-        b: UInt8,
-        g: UInt8,
-        r: UInt8
-    ) throws {
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(buffer))
-            .assumingMemoryBound(to: UInt8.self)
-        let offset = y * CVPixelBufferGetBytesPerRow(buffer) + x * 4
-        base[offset] = b
-        base[offset + 1] = g
-        base[offset + 2] = r
-        base[offset + 3] = 255
-    }
-
-    private func makeNV12PixelBuffer(
-        width: Int,
-        height: Int,
-        y: UInt8 = 16,
-        u: UInt8 = 128,
-        v: UInt8 = 128
-    ) throws -> CVPixelBuffer {
-        var pixelBuffer: CVPixelBuffer?
-        // IOSurface-backed so VideoToolbox takes it on the AVC420 fallback path.
-        XCTAssertEqual(
-            CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                width,
-                height,
-                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary,
-                &pixelBuffer
-            ),
-            kCVReturnSuccess
-        )
-        let buffer = try XCTUnwrap(pixelBuffer)
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        let yBase = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(buffer, 0))
-            .assumingMemoryBound(to: UInt8.self)
-        let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
-        for row in 0..<height {
-            let samples = yBase.advanced(by: row * yStride)
-            for column in 0..<width { samples[column] = y }
-        }
-        let uvBase = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(buffer, 1))
-            .assumingMemoryBound(to: UInt8.self)
-        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
-        for row in 0..<(height / 2) {
-            let samples = uvBase.advanced(by: row * uvStride)
-            for column in stride(from: 0, to: width, by: 2) {
-                samples[column] = u
-                samples[column + 1] = v
             }
         }
         return buffer

@@ -419,15 +419,4 @@ public enum DisplayTopology {
         mode.pixelHeight > 0 ? mode.pixelHeight : mode.height
     }
 
-    /// Current physical panel label for status UI, e.g. `1512×982 (HiDPI)`.
-    public static func currentPhysicalResolutionTitle(preferredIdentity: String = "") -> String? {
-        guard let displayID = physicalDisplayID(preferredIdentity: preferredIdentity),
-              let mode = CGDisplayCopyDisplayMode(displayID)
-        else {
-            return nil
-        }
-        var label = "\(mode.width)×\(mode.height)"
-        if isHiDPIMode(mode) { label += " (HiDPI)" }
-        return label
-    }
 }

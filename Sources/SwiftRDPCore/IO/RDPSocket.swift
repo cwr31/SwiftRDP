@@ -10,8 +10,7 @@ public final class RDPSocket {
         case video
     }
 
-    public var onWrite: (([UInt8]) -> Void)?
-    public var onPrioritizedWrite: (([[UInt8]], WritePriority, WriteCompletion?) -> Bool)?
+    public var onWriteBatch: (([[UInt8]], WritePriority, WriteCompletion?) -> Bool)?
     public var onClose: (() -> Void)?
 
     public init() {}
@@ -23,13 +22,7 @@ public final class RDPSocket {
 
     @discardableResult
     public func writeBatch(_ packets: [[UInt8]], priority: WritePriority, onWritten: WriteCompletion? = nil) -> Bool {
-        if let onPrioritizedWrite {
-            return onPrioritizedWrite(packets, priority, onWritten)
-        } else {
-            for packet in packets { onWrite?(packet) }
-            onWritten?(DispatchTime.now().uptimeNanoseconds)
-            return true
-        }
+        onWriteBatch?(packets, priority, onWritten) ?? false
     }
 
     public func close() {

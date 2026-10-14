@@ -10,7 +10,8 @@ in Swift.
 - RDP server with TLS and optional CredSSP/NLA authentication.
 - Native macOS screen capture and remote keyboard/mouse input.
 - Bitmap, H.264, and progressive RemoteFX display paths.
-- Adaptive video transport with configurable quality and frame rate.
+- Adaptive video transport with configurable quality and frame rate ([control policy](docs/video-adaptation.md)).
+- Reliable UDP2 graphics transport with TLS and Soft-Sync; input and control remain on TCP.
 - Text, image, and file clipboard synchronization.
 - System audio forwarding to the RDP client.
 - Physical display selection and optional virtual-display mode.
@@ -74,6 +75,15 @@ from `~/Library/Application Support/SwiftRDP`.
 3. In the RDP client, connect to the Mac's IP address on port `3389`.
 4. Use the username and password shown in SwiftRDP settings.
 
+One authenticated desktop is active at a time. A replacement connection takes
+over only after authentication and connection finalization succeed.
+
+Supporting clients automatically negotiate UDP2 for H.264/RemoteFX graphics.
+TCP and UDP use the configured RDP port (`3389` by default). The Connections
+page shows `TCP + UDP2` after Soft-Sync completes. If UDP cannot be established,
+the session continues on TCP. See [multitransport](docs/multitransport.md) for
+protocol details and verification.
+
 The GUI generates a random password on first launch. The standalone
 command-line target has development defaults, so always provide explicit
 credentials before exposing it beyond a trusted local network. Prefer a VPN
@@ -81,12 +91,11 @@ or firewall rather than exposing an RDP port directly to the public Internet.
 
 ## Runtime data
 
-SwiftRDP generates its self-signed TLS certificate and authentication cache
+SwiftRDP generates its self-signed TLS certificate
 outside the repository:
 
 ```text
 ~/Library/Application Support/SwiftRDP/certs/
-~/Library/Application Support/SwiftRDP/ntlm/
 ~/Library/Logs/SwiftRDP/
 ```
 

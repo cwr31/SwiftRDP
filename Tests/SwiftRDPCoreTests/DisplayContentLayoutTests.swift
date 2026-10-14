@@ -2,65 +2,92 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class DisplayContentLayoutTests: XCTestCase {
-    func testAspectsDifferIPadVsMac() {
-        // iPad-ish 4:3 vs MacBook 3024×1964
-        XCTAssertTrue(
-            DisplayContentLayout.aspectsDiffer(2224, 1668, 3024, 1964)
+    func testSmallAspectMismatchStillUsesAnAspectFitRect() {
+        let layout = DisplayContentLayout.aspectFit(
+            desktopWidth: 1920, desktopHeight: 1080,
+            sourceWidth: 1920, sourceHeight: 1081
         )
-        XCTAssertFalse(
-            DisplayContentLayout.aspectsDiffer(1512, 982, 3024, 1964)
-        )
+        XCTAssertEqual(layout.contentWidth, 1918)
+        XCTAssertEqual(layout.contentHeight, 1080)
+        XCTAssertEqual(layout.offsetX, 1)
     }
 
-    func testPhysicalMirrorPlanForcesPanelWhenAspectDiffers() {
-        let plan = DisplayContentLayout.physicalMirrorPlan(
+    func testIPadDesktopPreservesPanelAspect() {
+        let layout = DisplayContentLayout.aspectFit(
             desktopWidth: 2224,
             desktopHeight: 1668,
-            panelWidth: 3024,
-            panelHeight: 1964
+            sourceWidth: 3024,
+            sourceHeight: 1964
         )
-        // Capture is exactly the panel: padding would shift a scalesToFit stream.
-        XCTAssertEqual(plan.captureWidth, 3024)
-        XCTAssertEqual(plan.captureHeight, 1964)
-        XCTAssertFalse(plan.layout.isLetterboxed)
-        XCTAssertEqual(plan.layout.desktopWidth, 3024)
-        XCTAssertEqual(plan.layout.desktopHeight, 1964)
-        XCTAssertEqual(plan.layout.contentWidth, 3024)
-        XCTAssertEqual(plan.layout.contentHeight, 1964)
-        XCTAssertEqual(plan.layout.offsetX, 0)
-        XCTAssertEqual(plan.layout.offsetY, 0)
+        XCTAssertEqual(layout.desktopWidth, 2224)
+        XCTAssertEqual(layout.desktopHeight, 1668)
+        XCTAssertEqual(layout.contentWidth, 2224)
+        XCTAssertEqual(layout.contentHeight, 1444)
+        XCTAssertEqual(layout.offsetX, 0)
+        XCTAssertEqual(layout.offsetY, 112)
     }
 
-    func testPhysicalMirrorPlanFullBleedWhenOneToOne() {
-        let plan = DisplayContentLayout.physicalMirrorPlan(
+    func testIPhoneLandscapePreservesPanelAspect() {
+        let layout = DisplayContentLayout.aspectFit(
+            desktopWidth: 1424,
+            desktopHeight: 700,
+            sourceWidth: 3024,
+            sourceHeight: 1964
+        )
+
+        XCTAssertEqual(layout.desktopWidth, 1424)
+        XCTAssertEqual(layout.desktopHeight, 700)
+        XCTAssertEqual(layout.contentWidth, 1078)
+        XCTAssertEqual(layout.contentHeight, 700)
+        XCTAssertEqual(layout.offsetX, 173)
+        XCTAssertEqual(layout.offsetY, 0)
+        XCTAssertEqual(
+            Double(layout.contentWidth) / Double(layout.contentHeight),
+            3024.0 / 1964.0,
+            accuracy: 0.002
+        )
+    }
+
+    func testIPhonePortraitPreservesPanelAspect() {
+        let layout = DisplayContentLayout.aspectFit(
+            desktopWidth: 700,
+            desktopHeight: 1424,
+            sourceWidth: 3024,
+            sourceHeight: 1964
+        )
+
+        XCTAssertEqual(layout.desktopWidth, 700)
+        XCTAssertEqual(layout.desktopHeight, 1424)
+        XCTAssertEqual(layout.contentWidth, 700)
+        XCTAssertEqual(layout.contentHeight, 454)
+        XCTAssertEqual(layout.offsetX, 0)
+        XCTAssertEqual(layout.offsetY, 485)
+    }
+
+    func testPanelSizedDesktopHasNoBars() {
+        let layout = DisplayContentLayout.aspectFit(
             desktopWidth: 3024,
             desktopHeight: 1964,
-            panelWidth: 3024,
-            panelHeight: 1964
+            sourceWidth: 3024,
+            sourceHeight: 1964
         )
-        XCTAssertEqual(plan.captureWidth, 3024)
-        XCTAssertEqual(plan.captureHeight, 1964)
-        XCTAssertFalse(plan.layout.isLetterboxed)
-        XCTAssertEqual(plan.layout.desktopWidth, 3024)
-        XCTAssertEqual(plan.layout.desktopHeight, 1964)
-        XCTAssertEqual(plan.layout.offsetX, 0)
-        XCTAssertEqual(plan.layout.offsetY, 0)
+        XCTAssertEqual(layout.desktopWidth, 3024)
+        XCTAssertEqual(layout.desktopHeight, 1964)
+        XCTAssertEqual(layout.offsetX, 0)
+        XCTAssertEqual(layout.offsetY, 0)
     }
 
-    func testPhysicalMirrorPlanSameAspectAlsoForcesPanel() {
-        let plan = DisplayContentLayout.physicalMirrorPlan(
+    func testSameAspectKeepsSmallerClientDesktop() {
+        let layout = DisplayContentLayout.aspectFit(
             desktopWidth: 1512,
             desktopHeight: 982,
-            panelWidth: 3024,
-            panelHeight: 1964
+            sourceWidth: 3024,
+            sourceHeight: 1964
         )
-        XCTAssertEqual(plan.captureWidth, 3024)
-        XCTAssertEqual(plan.captureHeight, 1964)
-        XCTAssertFalse(plan.layout.isLetterboxed)
-        XCTAssertEqual(plan.layout.desktopWidth, 3024)
-        XCTAssertEqual(plan.layout.desktopHeight, 1964)
-        XCTAssertEqual(plan.layout.contentWidth, 3024)
-        XCTAssertEqual(plan.layout.contentHeight, 1964)
+        XCTAssertEqual(layout.desktopWidth, 1512)
+        XCTAssertEqual(layout.desktopHeight, 982)
+        XCTAssertEqual(layout.contentWidth, 1512)
+        XCTAssertEqual(layout.contentHeight, 982)
     }
 
     func testMouseMappingThroughLetterbox() {

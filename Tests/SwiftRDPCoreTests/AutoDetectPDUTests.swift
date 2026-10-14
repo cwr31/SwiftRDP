@@ -1,9 +1,11 @@
+import NIOEmbedded
 import XCTest
 @testable import SwiftRDPCore
 
 final class AutoDetectPDUTests: XCTestCase {
     func testEachMeasurementNotifiesOnceAndCarriesIndependentSampleIdentity() {
-        let detector = NetworkAutoDetect()
+        let loop = EmbeddedEventLoop()
+        let detector = NetworkAutoDetect(eventLoop: loop)
         defer { detector.stop() }
         var sent: [[UInt8]] = []
         var updates: [NetworkAutoDetect.Metrics] = []
@@ -25,17 +27,18 @@ final class AutoDetectPDUTests: XCTestCase {
         XCTAssertGreaterThan(updates[1].bandwidthMeasuredAtNanoseconds, 0)
     }
 
-    func testBandwidthStageGetsItsOwnDeadline() async throws {
-        let detector = NetworkAutoDetect()
+    func testBandwidthStageGetsItsOwnDeadline() {
+        let loop = EmbeddedEventLoop()
+        let detector = NetworkAutoDetect(eventLoop: loop)
         defer { detector.stop() }
         var sent: [[UInt8]] = []
         detector.onSend = { sent.append($0) }
         detector.beginConnectTime()
         let rttSequence = UInt16(sent[0][6]) | UInt16(sent[0][7]) << 8
-        try await Task.sleep(nanoseconds: 2_200_000_000)
+        loop.advanceTime(by: .milliseconds(2200))
         detector.handleClientResponse(.rtt(sequenceNumber: rttSequence))
         let bwSequence = UInt16(sent[1][6]) | UInt16(sent[1][7]) << 8
-        try await Task.sleep(nanoseconds: 1_000_000_000)
+        loop.advanceTime(by: .seconds(1))
         XCTAssertEqual(detector.phase, .connectBandwidth)
         detector.handleClientResponse(.bandwidthResults(
             sequenceNumber: bwSequence, responseType: AutoDetectPDU.bwResultsConnectTime,
@@ -43,6 +46,57 @@ final class AutoDetectPDUTests: XCTestCase {
         ))
         XCTAssertEqual(detector.phase, .complete)
         XCTAssertTrue(detector.metrics.hasBandwidth)
+    }
+
+    func testThreeConsecutiveContinuousProbeFailuresCloseConnectionOnce() {
+        let loop = EmbeddedEventLoop()
+        let detector = NetworkAutoDetect(eventLoop: loop)
+        var requests = 0
+        var failures = 0
+        detector.onSend = { _ in requests += 1 }
+        detector.onConnectionUnresponsive = { failures += 1 }
+        detector.startContinuous()
+        loop.advanceTime(by: .seconds(2))
+        for attempt in 0..<3 {
+            XCTAssertEqual(detector.phase, .continuousRTT)
+            loop.advanceTime(by: .seconds(3))
+            if attempt < 2 {
+                XCTAssertEqual(failures, 0)
+                loop.advanceTime(by: .seconds(12))
+            }
+        }
+        XCTAssertEqual(requests, 3)
+        XCTAssertEqual(failures, 1)
+        loop.advanceTime(by: .seconds(60))
+        XCTAssertEqual(requests, 3)
+        XCTAssertEqual(failures, 1)
+    }
+
+    func testSuccessfulProbeResetsFailureCountAndStopCancelsDeadlines() {
+        let loop = EmbeddedEventLoop()
+        let detector = NetworkAutoDetect(eventLoop: loop)
+        var sent: [[UInt8]] = []
+        var failures = 0
+        detector.onSend = { sent.append($0) }
+        detector.onConnectionUnresponsive = { failures += 1 }
+        detector.startContinuous()
+        loop.advanceTime(by: .seconds(2))
+        loop.advanceTime(by: .seconds(3)) // first missed probe
+        loop.advanceTime(by: .seconds(12))
+        let sequence = UInt16(sent.last![6]) | UInt16(sent.last![7]) << 8
+        loop.advanceTime(by: .milliseconds(200))
+        detector.handleClientResponse(.rtt(sequenceNumber: sequence))
+        XCTAssertEqual(detector.metrics.averageRTTMs, 200)
+        loop.advanceTime(by: .milliseconds(14_800))
+        loop.advanceTime(by: .seconds(3)) // one failure since successful response
+        loop.advanceTime(by: .seconds(12))
+        loop.advanceTime(by: .seconds(3)) // two failures since successful response
+        XCTAssertEqual(failures, 0)
+        detector.stop()
+        let count = sent.count
+        loop.advanceTime(by: .seconds(60))
+        XCTAssertEqual(sent.count, count)
+        XCTAssertEqual(failures, 0)
     }
 
     func testBandwidthKbpsFormula() {
@@ -101,7 +155,8 @@ final class AutoDetectPDUTests: XCTestCase {
     }
 
     func testProbeResponsesRequireMatchingOutstandingSequence() {
-        let detector = NetworkAutoDetect()
+        let loop = EmbeddedEventLoop()
+        let detector = NetworkAutoDetect(eventLoop: loop)
         var sent: [[UInt8]] = []
         var finished = false
         detector.onSend = { sent.append($0) }
@@ -140,7 +195,8 @@ final class AutoDetectPDUTests: XCTestCase {
     }
 
     func testNetworkCharacteristicsSyncCancelsCurrentProbe() {
-        let detector = NetworkAutoDetect()
+        let loop = EmbeddedEventLoop()
+        let detector = NetworkAutoDetect(eventLoop: loop)
         var sent: [[UInt8]] = []
         var finished = false
         detector.onSend = { sent.append($0) }

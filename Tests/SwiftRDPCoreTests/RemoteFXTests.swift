@@ -120,72 +120,6 @@ final class RemoteFXTests: XCTestCase {
         XCTAssertGreaterThan(stats.psnr, 24, "bars PSNR=\(stats.psnr)")
     }
 
-    func testScaleDirtyRectsMapsCaptureIntoSurface() throws {
-        let rects = [CGRect(x: 100, y: 200, width: 50, height: 80)]
-        let scaled = RDPSession.rfxScaleDirtyRects(
-            rects,
-            fromWidth: 1728,
-            fromHeight: 1080,
-            toWidth: 1424,
-            toHeight: 700
-        )
-        XCTAssertEqual(scaled.count, 1)
-        let r = try XCTUnwrap(scaled.first)
-        XCTAssertEqual(r.origin.x, 100 * (1424.0 / 1728.0), accuracy: 0.01)
-        XCTAssertEqual(r.origin.y, 200 * (700.0 / 1080.0), accuracy: 0.01)
-        XCTAssertEqual(r.size.width, 50 * (1424.0 / 1728.0), accuracy: 0.01)
-        XCTAssertEqual(r.size.height, 80 * (700.0 / 1080.0), accuracy: 0.01)
-    }
-
-    func testPrepareFrameForSurfaceScalesTileGridToSurface() throws {
-        let srcW = 1728
-        let srcH = 1080
-        let dstW = 1424
-        let dstH = 700
-        var src: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault, srcW, srcH, kCVPixelFormatType_32BGRA,
-            [
-                kCVPixelBufferCGImageCompatibilityKey: true,
-                kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
-            ] as CFDictionary,
-            &src
-        )
-        XCTAssertEqual(status, kCVReturnSuccess)
-        let srcPB = try XCTUnwrap(src)
-
-        let frame = CapturedFrame(
-            width: srcW,
-            height: srcH,
-            bgrBottomUp: [],
-            dirtyRects: [CGRect(x: 0, y: 0, width: srcW, height: srcH)],
-            pixelBuffer: srcPB
-        )
-        let prepared = try XCTUnwrap(
-            RDPSession.rfxPrepareFrameForSurface(
-                frame: frame,
-                captureDirty: frame.dirtyRects ?? [],
-                surfaceWidth: dstW,
-                surfaceHeight: dstH,
-                transfer: PixelBufferTransfer()
-            )
-        )
-        XCTAssertTrue(prepared.didScale)
-        XCTAssertEqual(prepared.frame.width, dstW)
-        XCTAssertEqual(prepared.frame.height, dstH)
-        XCTAssertEqual(CVPixelBufferGetWidth(try XCTUnwrap(prepared.frame.pixelBuffer)), dstW)
-        XCTAssertEqual(CVPixelBufferGetHeight(try XCTUnwrap(prepared.frame.pixelBuffer)), dstH)
-
-        let expectedTiles =
-            ((dstW + 63) / 64) * ((dstH + 63) / 64)
-        XCTAssertEqual(expectedTiles, 253)
-        XCTAssertNotEqual(
-            ((srcW + 63) / 64) * ((srcH + 63) / 64),
-            expectedTiles
-        )
-    }
-
     func testProgressiveLadderRegionHasProgQuantsAndTileFirst() {
         let encoder = RemoteFXEncoder()
         let pixels = [UInt8](repeating: 0x80, count: 64 * 64 * 4)
@@ -396,56 +330,6 @@ final class RemoteFXTests: XCTestCase {
         let hCorner = try XCTUnwrap(RDPSession.rfxHashTile(pixelBuffer: buffer, x: 0, y: 0, w: 16, h: 16))
         let hOther = try XCTUnwrap(RDPSession.rfxHashTile(pixelBuffer: buffer, x: 48, y: 48, w: 16, h: 16))
         XCTAssertNotEqual(hCorner, hOther)
-    }
-
-    func testPixelBufferTransferScalesNV12ToBGRA() throws {
-        let w = 128
-        let h = 80
-        var pb: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault, w, h,
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary,
-            &pb
-        )
-        XCTAssertEqual(status, kCVReturnSuccess)
-        let buffer = try XCTUnwrap(pb)
-        CVPixelBufferLockBaseAddress(buffer, [])
-        let yBase = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(buffer, 0))
-            .assumingMemoryBound(to: UInt8.self)
-        let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
-        memset(yBase, 80, yStride * h)
-        let uvBase = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(buffer, 1))
-            .assumingMemoryBound(to: UInt8.self)
-        memset(uvBase, 128, CVPixelBufferGetBytesPerRowOfPlane(buffer, 1) * (h / 2))
-        CVPixelBufferUnlockBaseAddress(buffer, [])
-
-        let transfer = PixelBufferTransfer()
-        let scaled = try XCTUnwrap(transfer.transfer(
-            buffer, width: 64, height: 40,
-            pixelFormat: kCVPixelFormatType_32BGRA, scaling: .fill
-        ))
-        XCTAssertEqual(CVPixelBufferGetWidth(scaled), 64)
-        XCTAssertEqual(CVPixelBufferGetHeight(scaled), 40)
-        XCTAssertEqual(CVPixelBufferGetPixelFormatType(scaled), kCVPixelFormatType_32BGRA)
-
-        // Letterbox keeps the source aspect: 128x80 (8:5) into a 64x64 square
-        // leaves black bars, so the centre row is content and the top row is not.
-        let boxed = try XCTUnwrap(transfer.transfer(
-            buffer, width: 64, height: 64,
-            pixelFormat: kCVPixelFormatType_32BGRA, scaling: .letterbox
-        ))
-        XCTAssertEqual(CVPixelBufferGetWidth(boxed), 64)
-        XCTAssertEqual(CVPixelBufferGetHeight(boxed), 64)
-        CVPixelBufferLockBaseAddress(boxed, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(boxed, .readOnly) }
-        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(boxed))
-            .assumingMemoryBound(to: UInt8.self)
-        let stride = CVPixelBufferGetBytesPerRow(boxed)
-        let topPixel = base.advanced(by: 32 * 4)
-        let centerPixel = base.advanced(by: 32 * stride + 32 * 4)
-        XCTAssertEqual(Int(topPixel[0]), 0, "top row must be letterbox black")
-        XCTAssertGreaterThan(Int(centerPixel[0]), 0, "centre row must carry content")
     }
 
     func testMakeTileOpsRespectsBudgetAcrossFirstKeys() {

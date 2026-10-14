@@ -48,6 +48,7 @@ public final class NIOInboundHandler: ChannelInboundHandler {
     }
 
     public func channelActive(context: ChannelHandlerContext) {
+        session.noteMainEventLoop(context.eventLoop)
         // Kicked during register (single-session) before onClose was wired — drop now.
         if session.phase == .terminated {
             RDPLog.io.info("NIO: closing displaced connection before handshake")
@@ -65,7 +66,7 @@ public final class NIOInboundHandler: ChannelInboundHandler {
             RDPLog.io.info("NIO: handshake timeout — closing unauthenticated connection")
             context.close(promise: nil)
         }
-        session.socket.onPrioritizedWrite = { [weak self, weak context] bytes, priority, onWritten in
+        session.socket.onWriteBatch = { [weak self, weak context] bytes, priority, onWritten in
             guard let self, let context else { return false }
             return self.enqueueOutbound(bytes, priority: priority, onWritten: onWritten, context: context)
         }
@@ -149,7 +150,7 @@ public final class NIOInboundHandler: ChannelInboundHandler {
         }
         outboundLock.unlock()
 
-        session.updateGFXTCPBackpressure()
+        session.updateGraphicsBackpressure()
         if let queuedBytes {
             session.setNIOOutboundQueueBytes(queuedBytes)
         }
@@ -300,7 +301,7 @@ public final class NIOInboundHandler: ChannelInboundHandler {
         outboundDrainScheduled = shouldSchedule
         outboundLock.unlock()
         session.setNIOOutboundQueueBytes(queuedBytes)
-        session.updateGFXTCPBackpressure()
+        session.updateGraphicsBackpressure()
         if shouldSchedule {
             if !urgent, videoWaitNanoseconds > 0 {
                 pacedDrainTask = context.eventLoop.scheduleTask(

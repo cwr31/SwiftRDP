@@ -31,10 +31,11 @@ struct LogsView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
                 Text(lineCount == 0 ? L10n.t(.empty) : L10n.format(.linesCount, lineCount))
                     .font(.caption)
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
                 Spacer()
 
@@ -44,28 +45,33 @@ struct LogsView: View {
                 Toggle(L10n.t(.follow), isOn: $followTail)
                     .toggleStyle(.checkbox)
 
-                Button {
-                    loadLog(force: true)
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help(L10n.t(.refresh))
+                HStack(spacing: 6) {
+                    Button {
+                        loadLog(force: true)
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel(L10n.t(.refresh))
+                    .help(L10n.t(.refresh))
 
-                Button {
-                    revealLog()
-                } label: {
-                    Image(systemName: "folder")
+                    Button {
+                        revealLog()
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .accessibilityLabel(L10n.t(.reveal))
+                    .help(L10n.t(.reveal))
                 }
-                .buttonStyle(.borderless)
-                .help(L10n.t(.reveal))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
 
             HStack(spacing: 8) {
-                Image(systemName: "line.3.horizontal.decrease.circle")
+                Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 TextField(L10n.t(.filterPlaceholder), text: $filter)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
                 if !filter.isEmpty {
                     Button {
                         filter = ""
@@ -73,8 +79,16 @@ struct LogsView: View {
                         Image(systemName: "xmark.circle.fill")
                     }
                     .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(L10n.t(.clear))
                     .help(L10n.t(.clear))
                 }
+            }
+            .padding(8)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(.separator, lineWidth: 0.5)
             }
 
             if let loadError {
@@ -88,10 +102,10 @@ struct LogsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay {
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                        .strokeBorder(.separator, lineWidth: 0.5)
                 }
         }
-        .padding(16)
+        .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear { loadLog(force: true) }
         .onReceive(Self.refreshTick) { _ in loadLog(force: false) }
@@ -178,11 +192,11 @@ private struct LogTextView: NSViewRepresentable {
         textView.isRichText = false
         textView.importsGraphics = false
         textView.allowsUndo = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         textView.textColor = .labelColor
         textView.backgroundColor = .textBackgroundColor
         textView.drawsBackground = true
-        textView.textContainerInset = NSSize(width: 10, height: 10)
+        textView.textContainerInset = NSSize(width: 12, height: 12)
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.textContainer?.widthTracksTextView = true

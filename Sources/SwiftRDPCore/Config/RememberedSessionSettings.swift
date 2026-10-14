@@ -46,7 +46,7 @@ public struct RememberedSessionSettings: Codable, Equatable, Identifiable, Senda
     public var id: String
     public var clientName: String
     public var peerAddress: String
-    public var videoBitrate: Int
+    public var videoQuality: VideoQualitySettings
     public var videoFPS: Int
     public var audioPlaybackDestination: AudioPlaybackDestination
     public var resolution: RememberedResolution?
@@ -54,7 +54,7 @@ public struct RememberedSessionSettings: Codable, Equatable, Identifiable, Senda
 
     public init(
         identity: SessionClientIdentity,
-        videoBitrate: Int,
+        videoQuality: VideoQualitySettings,
         videoFPS: Int,
         audioPlaybackDestination: AudioPlaybackDestination,
         resolution: RememberedResolution? = nil,
@@ -63,7 +63,7 @@ public struct RememberedSessionSettings: Codable, Equatable, Identifiable, Senda
         self.id = identity.stableKey
         self.clientName = identity.clientName
         self.peerAddress = identity.peerAddress
-        self.videoBitrate = videoBitrate
+        self.videoQuality = videoQuality
         self.videoFPS = videoFPS
         self.audioPlaybackDestination = audioPlaybackDestination
         self.resolution = resolution

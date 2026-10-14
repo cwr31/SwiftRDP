@@ -1,14 +1,18 @@
 import CoreGraphics
+import CryptoKit
+import Darwin
 import Foundation
 import NIO
 import NIOSSL
 import NIOTLS
 
-/// TCP bind + live session registry.
+/// TCP/UDP listeners and live session registry.
 public final class SessionManager: @unchecked Sendable {
     public private(set) var config: ServerConfig
     private var group: MultiThreadedEventLoopGroup?
     private var channel: Channel?
+    private var udpChannel: Channel?
+    private(set) var multitransportListener: MultitransportListener?
 
     private let registryLock = NSLock()
     private struct SessionLifecycle {
@@ -21,8 +25,11 @@ public final class SessionManager: @unchecked Sendable {
         }
     }
 
-    /// The one TCP session allowed by the server. It may be connecting or active.
+    /// The authenticated desktop remains current while replacement connections negotiate.
     private var currentSession: RDPSession?
+    private var pendingSessions: [UUID: RDPSession] = [:]
+    private var stopping = false
+    private static let maximumPendingSessions = 4
     /// Retained briefly by session ID so an asynchronously closing displaced socket
     /// can finish its audit without touching the replacement session.
     private var sessionLifecycles: [UUID: SessionLifecycle] = [:]
@@ -45,11 +52,16 @@ public final class SessionManager: @unchecked Sendable {
     /// Refcount for CGDisplayHideCursor — hide on first desktop, show when last leaves.
     private var hostCursorRetainCount = 0
 
-    /// Auto-Reconnect cookies (MS-RDPBCGR ARC) keyed by LogonId.
-    private var autoReconnectCookies: [UInt32: (cookie: [UInt8], created: Date)] = [:]
+    private struct ReconnectCredential {
+        let logonID: UInt32
+        let userName: String
+        let random: [UInt8]
+        let issuedAt: UInt64
+    }
+    /// Only the last authenticated desktop may reconnect; issuing a cookie rotates the credential.
+    private var reconnectCredential: ReconnectCredential?
     private var nextLogonId: UInt32 = 1
-
-    private static let arcCookieTTL: TimeInterval = 3600
+    private static let arcCookieLifetimeNanoseconds: UInt64 = 3_600_000_000_000
 
     public let audit: ConnectionAudit
     /// App-provided durable settings lookup. Called after client identity is known,
@@ -57,11 +69,19 @@ public final class SessionManager: @unchecked Sendable {
     public var rememberedSettingsProvider: (@Sendable (SessionClientIdentity) -> RememberedSessionSettings?)?
     public var onAuthenticatedSessionStarted: ((UUID) -> Void)?
     public var onAuthenticatedSessionEnded: ((UUID) -> Void)?
+    public var onSessionStateChanged: (@Sendable () -> Void)?
 
     public init(config: ServerConfig, audit: ConnectionAudit = .shared) {
         self.config = config
         self.audit = audit
         self.hostDisplayMode = DisplayTopology.preferredMode(policy: config.hostDisplayPolicy)
+    }
+
+    func noteSessionStateChanged(_ session: RDPSession) {
+        let isCurrent = registryLock.withLock {
+            currentSession?.id == session.id && sessionLifecycles[session.id]?.wasActive == true
+        }
+        if isCurrent { onSessionStateChanged?() }
     }
 
     /// Reset host cursor retain count under lock (sync helper for async callers).
@@ -73,13 +93,21 @@ public final class SessionManager: @unchecked Sendable {
         return result
     }
 
-    public func applyVideoBitrate(_ bps: Int, to sessionID: UUID) {
+    public func applyVideoQuality(_ quality: VideoQualitySettings, to sessionID: UUID) {
         registryLock.lock()
         let session = currentSession?.id == sessionID && currentSession?.phase == .active
             ? currentSession
             : nil
         registryLock.unlock()
-        session?.applyVideoBitrate(bps)
+        session?.applyVideoQuality(quality)
+    }
+
+    /// Defaults for new clients; remembered and active session overrides stay intact.
+    public func updateDefaultVideoTargets(quality: VideoQualitySettings, fps: Int) {
+        registryLock.withLock {
+            config.videoQuality = quality
+            config.fps = min(max(fps, 1), VideoTargetController.maxFPS)
+        }
     }
 
     public func applyKnownPeersOnly(_ enabled: Bool) {
@@ -215,9 +243,7 @@ public final class SessionManager: @unchecked Sendable {
     public func applyHostResolution(
         width: Int,
         height: Int,
-        preferHiDPI: Bool = true,
-        logicalWidth: Int? = nil,
-        logicalHeight: Int? = nil
+        preferHiDPI: Bool = true
     ) {
         switch hostDisplayMode {
         case .physicalMirror:
@@ -252,16 +278,7 @@ public final class SessionManager: @unchecked Sendable {
             virtualOverrideHiDPI = preferHiDPI
             virtualOverrideLogicalWidth = logicalW
             virtualOverrideLogicalHeight = logicalH
-            if sharedVirtualDisplay.active || activeDesktopSession() != nil {
-                sharedVirtualDisplay.createMatching(
-                    width: w,
-                    height: h,
-                    preferHiDPI: preferHiDPI,
-                    logicalWidth: logicalW,
-                    logicalHeight: logicalH
-                )
-            }
-            activeDesktopSession()?.applyHostResolution(width: w, height: h)
+            refreshActiveDesktops(reason: "virtual resolution \(w)x\(h)")
             let tag = preferHiDPI ? " HiDPI \(logicalW)x\(logicalH)" : ""
             RDPLog.io.info("SessionManager: virtual resolution → \(w)x\(h)\(tag)")
         }
@@ -411,36 +428,32 @@ public final class SessionManager: @unchecked Sendable {
         manager.noteDisplayTopologyChanged(flags: flags)
     }
 
-    /// Install the new connection as the only current session and displace the old
-    /// one before the new handshake proceeds.
-    public func registerSession(_ session: RDPSession) {
-        let displaced: RDPSession?
+    /// Bound unauthenticated connections without disturbing the current desktop.
+    @discardableResult
+    public func registerSession(_ session: RDPSession) -> Bool {
         registryLock.lock()
+        defer { registryLock.unlock() }
+        guard !stopping, pendingSessions.count < Self.maximumPendingSessions else { return false }
         cancelVirtualDisplayDestroyLocked()
-        displaced = currentSession
-        currentSession = session
+        pendingSessions[session.id] = session
         session.sessionManager = self
         sessionLifecycles[session.id] = SessionLifecycle()
-        registryLock.unlock()
-
-        if let displaced, displaced.id != session.id {
-            RDPLog.io.info(
-                "SessionManager: replacing client old=\(displaced.id.uuidString) " +
-                "new=\(session.id.uuidString)"
-            )
-            displaced.terminate()
-        }
+        return true
     }
 
     /// Promote only after RDP authentication/capability finalization succeeds.
     @discardableResult
     public func promoteSession(_ session: RDPSession) -> Bool {
         registryLock.lock()
-        guard currentSession?.id == session.id else {
+        guard !stopping, pendingSessions.removeValue(forKey: session.id) != nil,
+              session.phase != .terminated else {
             registryLock.unlock()
             return false
         }
-
+        let displaced = currentSession
+        currentSession = session
+        reconnectCredential = nil
+        cancelVirtualDisplayDestroyLocked()
         sessionLifecycles[session.id]?.wasActive = true
         RDPLog.io.info("SessionManager: client promoted id=\(session.id.uuidString)")
         let peer = session.info.peerAddress
@@ -449,9 +462,11 @@ public final class SessionManager: @unchecked Sendable {
         let security = session.info.securityLabel
         registryLock.unlock()
 
+        if let displaced, displaced.id != session.id { displaced.terminate() }
+
         let identity = SessionClientIdentity(clientName: client, peerAddress: peer)
         if let settings = rememberedSettingsProvider?(identity) {
-            session.applyVideoBitrate(settings.videoBitrate)
+            session.applyVideoQuality(settings.videoQuality)
             session.applyVideoFPS(settings.videoFPS)
             session.applyAudioPlaybackDestination(settings.audioPlaybackDestination)
             if let resolution = settings.resolution {
@@ -533,7 +548,10 @@ public final class SessionManager: @unchecked Sendable {
 
     public func liveClientSnapshot() -> LiveClientSnapshot? {
         registryLock.lock()
-        let session = currentSession
+        let session = currentSession ?? pendingSessions.values.max {
+            (sessionLifecycles[$0.id]?.connectedAt ?? .distantPast)
+                < (sessionLifecycles[$1.id]?.connectedAt ?? .distantPast)
+        }
         let lifecycle = session.flatMap { sessionLifecycles[$0.id] }
         registryLock.unlock()
 
@@ -548,6 +566,7 @@ public final class SessionManager: @unchecked Sendable {
             userName: session.info.userName,
             clientName: session.info.clientName,
             securityLabel: session.info.securityLabel,
+            transportLabel: activeSnapshot?.transportLabel ?? session.transportLabel,
             phaseLabel: Self.phaseLabel(session.phase),
             width: w,
             height: h,
@@ -577,6 +596,7 @@ public final class SessionManager: @unchecked Sendable {
         let shouldDestroySharedVD: Bool
         registryLock.lock()
         let lifecycle = sessionLifecycles.removeValue(forKey: session.id)
+        pendingSessions.removeValue(forKey: session.id)
         let wasCurrent = currentSession?.id == session.id
         let wasActive = lifecycle?.wasActive ?? false
         let authFailed = lifecycle?.authFailed ?? false
@@ -584,10 +604,10 @@ public final class SessionManager: @unchecked Sendable {
         if wasCurrent {
             currentSession = nil
         }
-        shouldDestroySharedVD = wasCurrent && currentSession == nil
+        shouldDestroySharedVD = currentSession == nil && pendingSessions.isEmpty
         registryLock.unlock()
 
-        if !authFailed {
+        if lifecycle != nil, !authFailed {
             let peer = session.info.peerAddress.isEmpty ? "unknown" : session.info.peerAddress
             let duration: Int? = connectedAt.map { Int(Date().timeIntervalSince($0).rounded()) }
             if wasActive {
@@ -647,7 +667,7 @@ public final class SessionManager: @unchecked Sendable {
         registryLock.lock()
         defer { registryLock.unlock() }
         return generation == virtualDisplayDestroyGeneration
-            && currentSession == nil
+            && currentSession == nil && pendingSessions.isEmpty
     }
 
     private func destroyVirtualDisplayIfIdle(generation: UInt64) {
@@ -655,7 +675,7 @@ public final class SessionManager: @unchecked Sendable {
             registryLock.lock()
             defer { registryLock.unlock() }
             guard generation == virtualDisplayDestroyGeneration,
-                  currentSession == nil else { return false }
+                  currentSession == nil, pendingSessions.isEmpty else { return false }
             virtualDisplayDestroyTask = nil
             return true
         }
@@ -673,65 +693,48 @@ public final class SessionManager: @unchecked Sendable {
     // MARK: - Auto-Reconnect (ARC)
 
     /// Allocate LogonId + 16-byte ARC cookie for Save Session Info.
-    public func issueAutoReconnectCookie() -> (logonId: UInt32, cookie: [UInt8]) {
+    public func issueAutoReconnectCookie(
+        for session: RDPSession,
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> (logonId: UInt32, cookie: [UInt8])? {
         registryLock.lock()
         defer { registryLock.unlock() }
-        pruneExpiredARCCookiesLocked()
-        let logonId = nextLogonId
-        nextLogonId &+= 1
-        if nextLogonId == 0 { nextLogonId = 1 }
-        var cookie = [UInt8](repeating: 0, count: 16)
-        let status = SecRandomCopyBytes(kSecRandomDefault, cookie.count, &cookie)
-        if status != errSecSuccess {
-            for i in 0..<16 { cookie[i] = UInt8.random(in: 0...255) }
+        guard currentSession?.id == session.id else { return nil }
+        let logonId: UInt32
+        if session.info.logonId != 0 {
+            logonId = session.info.logonId
+        } else {
+            logonId = nextLogonId
+            nextLogonId &+= 1
+            if nextLogonId == 0 { nextLogonId = 1 }
         }
-        autoReconnectCookies[logonId] = (cookie, Date())
+        let cookie = SymmetricKey(size: .bits128).withUnsafeBytes { Array($0) }
+        reconnectCredential = ReconnectCredential(logonID: logonId, userName: session.info.userName,
+                                                   random: cookie, issuedAt: nowNanoseconds)
         RDPLog.io.info("ARC: issued logonId=\(logonId)")
         return (logonId, cookie)
     }
 
-    /// Validate client ARC cookie from Client Info extended data.
-    public func validateAutoReconnectCookie(logonId: UInt32, cookie: [UInt8]) -> Bool {
+    /// Enhanced RDP Security uses 32 zero bytes as ClientRandom (MS-RDPBCGR 5.5).
+    public func validateAutoReconnect(
+        logonID: UInt32, securityVerifier: [UInt8],
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> String? {
         registryLock.lock()
         defer { registryLock.unlock() }
-        pruneExpiredARCCookiesLocked()
-        guard let entry = autoReconnectCookies[logonId] else { return false }
-        guard entry.cookie.count == cookie.count else { return false }
-        var mismatch: UInt8 = 0
-        for i in 0..<cookie.count {
-            mismatch |= entry.cookie[i] ^ cookie[i]
-        }
-        let ok = mismatch == 0
-        if ok {
-            RDPLog.io.info("ARC: validated logonId=\(logonId)")
-        }
-        return ok
-    }
-
-    private func pruneExpiredARCCookiesLocked() {
-        let cutoff = Date().addingTimeInterval(-Self.arcCookieTTL)
-        autoReconnectCookies = autoReconnectCookies.filter { $0.value.created >= cutoff }
+        guard let credential = reconnectCredential, credential.logonID == logonID,
+              nowNanoseconds >= credential.issuedAt,
+              nowNanoseconds - credential.issuedAt < Self.arcCookieLifetimeNanoseconds,
+              HMAC<Insecure.MD5>.isValidAuthenticationCode(Data(securityVerifier),
+                  authenticating: Data(repeating: 0, count: 32),
+                  using: SymmetricKey(data: Data(credential.random))) else { return nil }
+        return credential.userName
     }
 
     public func session(for id: UUID) -> RDPSession? {
         registryLock.lock()
         defer { registryLock.unlock() }
-        return currentSession?.id == id ? currentSession : nil
-    }
-
-    /// Capture target used by sessions: shared VD id, else config/primary.
-    public func sharedCaptureDisplayID() -> UInt32? {
-        if sharedScreenCapture.isRunning,
-           let selected = sharedScreenCapture.selectedDisplayID,
-           selected != 0 {
-            return selected
-        }
-        if sharedVirtualDisplay.active, sharedVirtualDisplay.displayID != 0 {
-            return sharedVirtualDisplay.displayID
-        }
-        return DisplayTopology.physicalDisplayID(
-            preferredIdentity: config.selectedDisplayIdentity
-        )
+        return currentSession?.id == id ? currentSession : pendingSessions[id]
     }
 
     public var hasActiveSession: Bool {
@@ -745,7 +748,7 @@ public final class SessionManager: @unchecked Sendable {
         let session: RDPSession? = {
             registryLock.lock()
             defer { registryLock.unlock() }
-            return currentSession?.id == id ? currentSession : nil
+            return currentSession?.id == id ? currentSession : pendingSessions[id]
         }()
         session?.terminate()
     }
@@ -807,7 +810,7 @@ public final class SessionManager: @unchecked Sendable {
         public var configuredFPS: Int
         public var audioPlaybackDestination: AudioPlaybackDestination
         public var targetBitrate: Int
-        public var configuredBitrate: Int
+        public var videoQuality: VideoQualitySettings
         public var lastReportedBitrate: Int
         public var clientQueue: ClientQueueFeedback
         public var clientQueueDelayMs: Double
@@ -817,6 +820,7 @@ public final class SessionManager: @unchecked Sendable {
         public var hasRTTSamples: Bool
         /// Actual encode path, e.g. "H.264", "RemoteFX", "Bitmap".
         public var encodingLabel: String
+        public var transportLabel: String = "TCP"
         public var stallRecoveryMode: Bool
         public var frameAcknowledgementsSuspended: Bool
         public var bitrateReduced: Bool
@@ -846,7 +850,7 @@ public final class SessionManager: @unchecked Sendable {
             configuredFPS: 0,
             audioPlaybackDestination: .both,
             targetBitrate: 0,
-            configuredBitrate: 0,
+            videoQuality: .default,
             lastReportedBitrate: 0,
             clientQueue: .unavailable,
             clientQueueDelayMs: 0,
@@ -900,7 +904,7 @@ public final class SessionManager: @unchecked Sendable {
             configuredFPS: session.videoController.configuredFPS,
             audioPlaybackDestination: session.audioPlaybackDestination,
             targetBitrate: perf.targetBitrate,
-            configuredBitrate: perf.configuredBitrate,
+            videoQuality: session.videoQuality,
             lastReportedBitrate: perf.lastReportedBitrate,
             clientQueue: perf.clientQueue,
             clientQueueDelayMs: perf.clientQueueDelayMs,
@@ -909,6 +913,7 @@ public final class SessionManager: @unchecked Sendable {
             clientRenderMs: perf.clientRenderMs,
             hasRTTSamples: perf.sampleCount > 0,
             encodingLabel: session.encodingLabel,
+            transportLabel: session.transportLabel,
             stallRecoveryMode: perf.stallRecoveryMode,
             frameAcknowledgementsSuspended: session.gfx.isFrameAcknowledgementSuspended,
             bitrateReduced: perf.bitrateReduced,
@@ -923,6 +928,7 @@ public final class SessionManager: @unchecked Sendable {
     }
 
     public func start() async throws {
+        registryLock.withLock { stopping = false }
         RDPLog.enableFileLogging(appSupportName: config.appSupportName)
         RDPLog.verbose = config.devLog
         hostDisplayMode = DisplayTopology.preferredMode(policy: config.hostDisplayPolicy)
@@ -953,8 +959,27 @@ public final class SessionManager: @unchecked Sendable {
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         self.group = group
-        let publicKeyDER = material.subjectPublicKeyInfoDER
+        let publicKeyDER = material.subjectPublicKey
         let manager = self
+
+        let udpListener = MultitransportListener(sslContext: sslContext)
+        do {
+            udpChannel = try await DatagramBootstrap(group: group)
+                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .channelOption(ChannelOptions.socketOption(.init(rawValue: SO_REUSEPORT)), value: 1)
+                .channelOption(ChannelOptions.receivePacketInfo, value: true)
+                .channelOption(ChannelOptions.socketOption(.so_rcvbuf), value: 256 * 1024)
+                .channelOption(ChannelOptions.socketOption(.so_sndbuf), value: 256 * 1024)
+                .channelOption(ChannelOptions.recvAllocator, value: FixedSizeRecvByteBufferAllocator(capacity: 2048))
+                .channelOption(ChannelOptions.maxMessagesPerRead, value: 64)
+                .channelInitializer { $0.pipeline.addHandler(udpListener) }
+                .bind(host: config.bindHost, port: config.port).get()
+            multitransportListener = udpListener
+            RDPLog.io.info("RDP UDP2 listener ready on port \(config.port)")
+        } catch {
+            // Multitransport is optional: advertise it only when the UDP listener exists.
+            RDPLog.io.info("UDP listener unavailable; serving RDP over TCP: \(error)")
+        }
 
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.backlog, value: 8)
@@ -963,19 +988,26 @@ public final class SessionManager: @unchecked Sendable {
                 guard manager.allowConnection(from: channel.remoteAddress) else {
                     return channel.close()
                 }
-                let session = RDPSession(config: manager.config, serverPublicKeyDER: publicKeyDER)
+                let sessionConfig = manager.registryLock.withLock { manager.config }
+                let session = RDPSession(config: sessionConfig, serverPublicKeyDER: publicKeyDER)
                 if let host = channel.remoteAddress?.ipAddress, !host.isEmpty {
                     session.notePeerHost(host)
                 } else if let desc = channel.remoteAddress?.description {
                     session.notePeerHost(desc)
                 }
-                manager.registerSession(session)
+                session.noteMainEventLoop(channel.eventLoop)
+                guard manager.registerSession(session) else { return channel.close() }
                 manager.noteHandshakeStarted(session)
                 let transport = NIOTransport(session: session, sslContext: sslContext)
                 return channel.pipeline.addHandler(transport.inboundHandler)
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .childChannelOption(ChannelOptions.socketOption(.so_keepalive), value: 1)
+            // Bound a silent broken connection to about 30 seconds, including static desktops.
+            .childChannelOption(ChannelOptions.tcpOption(.init(rawValue: TCP_KEEPALIVE)), value: 15)
+            .childChannelOption(ChannelOptions.tcpOption(.init(rawValue: TCP_KEEPINTVL)), value: 5)
+            .childChannelOption(ChannelOptions.tcpOption(.init(rawValue: TCP_KEEPCNT)), value: 3)
+            .childChannelOption(ChannelOptions.tcpOption(.init(rawValue: TCP_RXT_CONNDROPTIME)), value: 30)
             .childChannelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
             .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 16)
             // Keep the TCP write-ahead bounded so interactive static channels are not
@@ -999,6 +1031,11 @@ public final class SessionManager: @unchecked Sendable {
             RDPLog.io.info("RDP Server listening on port \(config.port)")
         } catch {
             RDPLog.io.error("Could not bind to port \(config.port). Another RDP app or a previous instance may be using this port.")
+            try? await udpChannel?.close().get()
+            udpChannel = nil
+            multitransportListener = nil
+            try? await group.shutdownGracefully()
+            self.group = nil
             throw error
         }
 
@@ -1009,12 +1046,15 @@ public final class SessionManager: @unchecked Sendable {
         let sessions: [RDPSession] = {
             registryLock.lock()
             defer { registryLock.unlock() }
-            let list = currentSession.map { [$0] } ?? []
+            stopping = true
+            let list = (currentSession.map { [$0] } ?? []) + Array(pendingSessions.values)
             currentSession = nil
+            pendingSessions.removeAll()
+            reconnectCredential = nil
             sessionLifecycles.removeAll()
             return list
         }()
-        sessions.first?.terminate()
+        for session in sessions { session.terminate() }
         await sharedScreenCapture.stopAndWait()
         cancelVirtualDisplayDestroy()
         sharedVirtualDisplay.destroy()
@@ -1024,8 +1064,11 @@ public final class SessionManager: @unchecked Sendable {
             CGDisplayShowCursor(CGMainDisplayID())
         }
         try? await channel?.close().get()
+        try? await udpChannel?.close().get()
         try? await group?.shutdownGracefully()
         group = nil
         channel = nil
+        udpChannel = nil
+        multitransportListener = nil
     }
 }

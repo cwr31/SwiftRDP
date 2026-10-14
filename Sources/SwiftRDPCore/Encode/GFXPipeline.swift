@@ -5,8 +5,7 @@ import CoreGraphics
 /// RDPEGFX pipeline — H.264 or RemoteFX Progressive over the dynamic Graphics channel.
 ///
 /// Wire path:
-///   shared SCKit IOSurface (BGRA canonical; NV12 accepted for direct callers)
-///     → GPU pixel transfer when AVC420 needs NV12
+///   shared SCKit NV12 IOSurface
 ///     → single-pass Annex-B access unit (NAL 1/5/7/8)
 ///     → RFX_AVC420 metablock with tile-aligned regions
 ///     → ZGFX (uncompressed for AVC payloads) → START / WIRE_TO_SURFACE / END
@@ -23,15 +22,14 @@ public final class GFXPipeline: @unchecked Sendable {
         case blocked
     }
 
-    public let h264 = H264Encoder()
+    public private(set) var h264 = H264Encoder()
+    private var refinementEncoder: H264Encoder?
     /// RFX state is connection-local and is consumed only by this serial queue.
     private let rfxEncoder = RemoteFXEncoder()
     private let rfxQueue = DispatchQueue(
         label: "com.swiftrdp.gfx.rfx",
         qos: .userInitiated
     )
-    /// GPU pixel format / scale conversions (capture geometry mismatches only).
-    let pixelTransfer = PixelBufferTransfer()
     /// mstsc caches EGFX surfaces by id for the lifetime of the process; reusing
     /// surface 0 on reconnect paints into a stale surface (black screen + live cursor).
     private static let surfaceIDLock = NSLock()
@@ -82,6 +80,8 @@ public final class GFXPipeline: @unchecked Sendable {
     /// configured codec. This is terminal for the Graphics channel, not a
     /// transient encoder failure.
     public var onCapabilityFailure: (() -> Void)?
+    /// Lifecycle changes are delivered asynchronously, never under the pipeline lock.
+    public var onStateChanged: (@Sendable () -> Void)?
     /// Encoder slots, FRAME_ACK flow control, or TCP send availability changed. The desktop loop
     /// uses this to resume immediately instead of polling.
     public var onWorkAvailable: (() -> Void)?
@@ -107,19 +107,24 @@ public final class GFXPipeline: @unchecked Sendable {
     private static let maxEncodeFailures = 12
     /// A dropped picture is encoder backpressure, not a reference-chain failure.
     /// Retry at the next frame boundary without creating a keyframe burst.
-    private static let h264DropRetryDelayMaximum: TimeInterval = 0.25
-    private var h264DropResumeNotBefore = Date.distantPast
+    private static let h264DropRetryDelayMaximumNanoseconds: UInt64 = 250_000_000
+    private var frameScheduler = AVCFrameScheduler()
     private var audioQueuePressure = false
 
-    /// True when the single encode/send reservation is occupied.
-    public var isEncodeInFlight: Bool {
+    /// True when the bounded encode/output pipeline has no free slot.
+    public var isEncodeWindowFull: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return rfxEncodeInFlight || encodesInFlight >= maxEncodesInFlight
     }
 
-    /// True when the FRAME_ACK window is saturated — capture should poll tightly
-    /// instead of sleeping a full frame period.
+    var hasPendingEncode: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return rfxEncodeInFlight || encodesInFlight > 0
+    }
+
+    /// Capture resumes when FRAME_ACK returns credit to this window.
     public var isAckWindowFull: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -133,11 +138,16 @@ public final class GFXPipeline: @unchecked Sendable {
         return frameAcknowledgementWindow
     }
 
+    var queuedEncodedFrameCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return readyH264Frames.count
+    }
+
     /// Requested codec before CAPS negotiation.
     public var preferredCodec: GraphicsCodec = .h264AVC420
     /// Codec selected by the client's advertised capability set.
     public private(set) var activeCodec: GraphicsCodec = .h264AVC420
-    public var asyncEncoding = true
     public var targetFPS = 30
     /// `VideoBitrate` (bps) — forwarded to VideoToolbox AverageBitRate.
     public var targetBitrate = 12_500_000
@@ -181,9 +191,11 @@ public final class GFXPipeline: @unchecked Sendable {
     /// RFX has one bounded worker operation; newer capture samples are coalesced
     /// by RDPSession while this reservation is active.
     private var rfxEncodeInFlight = false
-    /// A single reservation keeps VideoToolbox's reference chain ordered with
-    /// the transport queue. New capture samples replace old ones before encode.
-    private let maxEncodesInFlight = 1
+    /// Ordered reservations bound native work and completed reference pictures.
+    /// New capture samples replace old ones before encode.
+    private let maxEncodesInFlight = H264Encoder.maxFramesInFlight
+    private var readyH264Frames: [ReadyH264Frame] = []
+    private var drainingH264Frames = false
     private var transport: (any GraphicsTransport)?
 
     /// Effective encode FPS after backpressure / RDM adaptation.
@@ -317,12 +329,13 @@ public final class GFXPipeline: @unchecked Sendable {
         graphicsInitialized = false
         sendPaused = false
         encodesInFlight = 0
+        readyH264Frames.removeAll(keepingCapacity: true)
         rfxEncodeInFlight = false
         needsBootstrapIDR = false
         bootstrapIDRFrameId = nil
         keyframeInFlight = false
         referenceChainBroken = false
-        h264DropResumeNotBefore = .distantPast
+        resetFrameState()
         sendBlocked = false
         expectsFrameAcknowledgements = true
         consecutiveBackpressure = 0
@@ -342,6 +355,12 @@ public final class GFXPipeline: @unchecked Sendable {
     private func queueRFXReset() {
         let encoder = rfxEncoder
         rfxQueue.async { encoder.reset() }
+    }
+
+    private func notifyStateChanged() {
+        if let onStateChanged {
+            DispatchQueue.global(qos: .userInitiated).async(execute: onStateChanged)
+        }
     }
 
     /// Send related Graphics PDUs after releasing `stateLock`.
@@ -379,10 +398,10 @@ public final class GFXPipeline: @unchecked Sendable {
         return running && surfacesReady
     }
 
-    public var hasPendingForcedFrame: Bool {
+    var nextFrameWaitNanoseconds: UInt64? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return needsBootstrapIDR || forceIDR
+        return frameScheduler.nextWaitNanoseconds(now: DispatchTime.now().uptimeNanoseconds)
     }
 
     var isFrameAcknowledgementSuspended: Bool {
@@ -416,7 +435,6 @@ public final class GFXPipeline: @unchecked Sendable {
                 "for \(width)x\(height) (H.264 Level 5.2)"
             )
         }
-        h264.asyncMode = asyncEncoding
         if activeCodec.isProgressive {
             RDPLog.gfx.info("GFX: RemoteFX Progressive requested; waiting for CAPS")
         } else {
@@ -434,13 +452,14 @@ public final class GFXPipeline: @unchecked Sendable {
             surfacesReady = false
             pipelineGeneration &+= 1
             encodesInFlight = 0
+            readyH264Frames.removeAll(keepingCapacity: true)
             rfxEncodeInFlight = false
             queueRFXReset()
             needsBootstrapIDR = false
             bootstrapIDRFrameId = nil
             keyframeInFlight = false
             referenceChainBroken = false
-            h264DropResumeNotBefore = .distantPast
+            resetFrameState()
             consecutiveBackpressure = 0
             consecutiveEncodeFailures = 0
             forceIDR = false
@@ -495,8 +514,9 @@ public final class GFXPipeline: @unchecked Sendable {
         forceIDR = false
         keyframeInFlight = false
         referenceChainBroken = false
-        h264DropResumeNotBefore = .distantPast
+        resetFrameState()
         encodesInFlight = 0
+        readyH264Frames.removeAll(keepingCapacity: true)
         surfacesReady = true
         RDPLog.gfx.info(
             activeCodec.isProgressive
@@ -505,6 +525,7 @@ public final class GFXPipeline: @unchecked Sendable {
         )
         RDPLog.gfx.info("GFX: pipeline ready (init in one pass)")
         RDPLog.gfx.info("GFX: started \(width)x\(height) surface=\(surfaceId)")
+        notifyStateChanged()
     }
 
     public func stop() {
@@ -520,8 +541,9 @@ public final class GFXPipeline: @unchecked Sendable {
         bootstrapIDRFrameId = nil
         keyframeInFlight = false
         referenceChainBroken = false
-        h264DropResumeNotBefore = .distantPast
+        resetFrameState()
         encodesInFlight = 0
+        readyH264Frames.removeAll(keepingCapacity: true)
         rfxEncodeInFlight = false
         pipelineGeneration &+= 1
         consecutiveBackpressure = 0
@@ -535,6 +557,7 @@ public final class GFXPipeline: @unchecked Sendable {
         resetUnacked()
         RDPLog.gfx.info("GFX: pipeline cleaned up")
         RDPLog.gfx.info("GFX: channel closed")
+        notifyStateChanged()
     }
 
     /// Suppress Output — pause encode/send without tearing down the pipeline.
@@ -559,15 +582,19 @@ public final class GFXPipeline: @unchecked Sendable {
         RDPLog.gfx.error("GFX: channel create failed: \(error)")
     }
 
-    public func noteWriteErrorDuringFrame(_ message: String) {
-        RDPLog.gfx.error("GFX: write error during frame send \(message)")
-    }
-
     public func requestForceIDR(reason: String = "") {
         stateLock.lock()
-        defer { stateLock.unlock() }
         forceIDR = true
+        stateLock.unlock()
         RDPLog.gfx.info("GFX: force IDR requested (\(reason))")
+        onWorkAvailable?()
+    }
+
+    func requestStaticRefinement() {
+        stateLock.lock()
+        frameScheduler.requestRefinement(now: DispatchTime.now().uptimeNanoseconds)
+        stateLock.unlock()
+        onWorkAvailable?()
     }
 
     /// Pause outbound GFX while the TCP send path is full.
@@ -583,18 +610,28 @@ public final class GFXPipeline: @unchecked Sendable {
             "GFX: output admission \(blocked ? "blocked" : "writable") — " +
             "encode admission \(blocked ? "paused" : "resumed")"
         )
+        if !blocked { drainEncodedFrames() }
         onWorkAvailable?()
     }
 
     private struct EncodeReservation: Sendable {
         let generation: UInt64
+        let submission: AVCFrameScheduler.Submission
         let requiresIDR: Bool
         let width: Int
         let height: Int
-        let useAsync: Bool
+        let bitrate: Int
+        let fps: Int
         let captureAgeMs: Double
-        /// Scale/letterbox time before VT submit (ms); filled by `encodeFrame`.
-        var prepMs: Double = 0
+    }
+
+    private struct ReadyH264Frame {
+        let encoded: H264Encoder.EncodedAccessUnit
+        let left: UInt16
+        let top: UInt16
+        let right: UInt16
+        let bottom: UInt16
+        let reservation: EncodeReservation
     }
 
     private struct RFXReservation: Sendable {
@@ -608,36 +645,24 @@ public final class GFXPipeline: @unchecked Sendable {
         case progressive([RemoteFXEncoder.TileOp])
     }
 
-    private func pendingH264FrameRequirement() -> Bool? {
+    private func reserveH264Encode(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        captureSequence: UInt64,
+        captureAgeMs: Double
+    ) -> EncodeReservation? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard running, surfacesReady, !sendPaused,
-              !sendBlocked,
-              !activeCodec.isProgressive,
-              encodesInFlight < maxEncodesInFlight
-        else { return nil }
-        applyLiveCaps()
-        pollAckWatchdog()
-        guard Date() >= h264DropResumeNotBefore else { return nil }
-        guard !expectsFrameAcknowledgements || ackTracker.count < frameAcknowledgementWindow else {
-            return nil
-        }
-        guard !referenceChainBroken || !h264.hasPendingFrames else { return nil }
-        let forced = needsBootstrapIDR || forceIDR
-        guard !forced || (!keyframeInFlight && !h264.hasPendingFrames) else { return nil }
-        return forced
-    }
-
-    private func reserveH264Encode(captureAgeMs: Double) -> EncodeReservation? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard running, surfacesReady, !sendPaused,
-              !sendBlocked else { return nil }
+        guard running, surfacesReady, !sendPaused else { return nil }
+        guard sourceWidth == width, sourceHeight == height else { return nil }
+        let now = DispatchTime.now().uptimeNanoseconds
+        frameScheduler.observe(sequence: captureSequence, now: now)
+        guard !sendBlocked else { return nil }
         guard encodesInFlight < maxEncodesInFlight else { return nil }
         applyLiveCaps()
         pollAckWatchdog()
+        guard !keyframeInFlight else { return nil }
         guard !activeCodec.isProgressive else { return nil }
-        guard Date() >= h264DropResumeNotBefore else { return nil }
         guard !expectsFrameAcknowledgements || ackTracker.count < frameAcknowledgementWindow else {
             return nil
         }
@@ -645,41 +670,81 @@ public final class GFXPipeline: @unchecked Sendable {
 
         // Bootstrap and reference-chain recovery both wait for prior VT work to
         // finish before submitting the next IDR.
-        let requiresIDR = needsBootstrapIDR || forceIDR
-        guard !requiresIDR || (!keyframeInFlight && !h264.hasPendingFrames) else { return nil }
+        let forced = needsBootstrapIDR || forceIDR
+        var requiresIDR = forced || referenceChainBroken
+        guard !requiresIDR || !h264.hasPendingFrames else { return nil }
+        guard let submission = frameScheduler.reserve(
+            sequence: captureSequence, forced: forced, now: now
+        ) else { return nil }
+        requiresIDR = requiresIDR || submission.isRefinement
         encodesInFlight += 1
         if requiresIDR {
             forceIDR = false
             keyframeInFlight = true
-            h264.requestForceKeyframe()
-            RDPLog.gfx.info("GFX: encoding requested IDR for next wire frame")
+            if !submission.isRefinement { h264.requestForceKeyframe() }
+            RDPLog.gfx.info("GFX: encoding IDR (static trial=\(submission.isRefinement))")
         }
         return EncodeReservation(
             generation: pipelineGeneration,
+            submission: submission,
             requiresIDR: requiresIDR,
             width: max(width, 1),
             height: max(height, 1),
-            useAsync: asyncEncoding && h264.asyncMode,
-            captureAgeMs: captureAgeMs,
-            prepMs: 0
+            bitrate: effectiveBitrate,
+            fps: constrainedFPSLocked(targetFPS),
+            captureAgeMs: captureAgeMs
         )
     }
 
-    private func releaseEncodeSlot(_ reservation: EncodeReservation) {
+    private func releaseEncodeSlot(_ reservation: EncodeReservation, retryAfterNanoseconds: UInt64) {
         guard pipelineGeneration == reservation.generation else { return }
+        frameScheduler.complete(reservation.submission, sent: false,
+            now: DispatchTime.now().uptimeNanoseconds, retryAfterNanoseconds: retryAfterNanoseconds)
         encodesInFlight = max(0, encodesInFlight - 1)
         onWorkAvailable?()
     }
 
-    private func releaseEncodeSlotAfterSend(_ reservation: EncodeReservation) {
+    private func releaseEncodeSlotAfterSend(_ reservation: EncodeReservation, sent: Bool,
+                                          meanSquaredError: Double?) {
+        var obsoleteEncoder: H264Encoder?
         stateLock.lock()
         guard pipelineGeneration == reservation.generation else {
             stateLock.unlock()
             return
         }
+        if reservation.submission.isRefinement {
+            if sent, let candidate = refinementEncoder {
+                obsoleteEncoder = h264
+                h264 = candidate
+                h264.updateBitrate(targetBitrate)
+                h264.updateExpectedFrameRate(constrainedFPSLocked(targetFPS))
+            } else {
+                obsoleteEncoder = refinementEncoder
+            }
+            refinementEncoder = nil
+            keyframeInFlight = false
+        }
+        frameScheduler.complete(reservation.submission, sent: sent,
+            now: DispatchTime.now().uptimeNanoseconds, meanSquaredError: meanSquaredError)
         encodesInFlight = max(0, encodesInFlight - 1)
         stateLock.unlock()
+        obsoleteEncoder?.stop()
         onWorkAvailable?()
+    }
+
+    private func resetFrameState() {
+        frameScheduler = AVCFrameScheduler()
+        refinementEncoder?.stop()
+        refinementEncoder = nil
+    }
+
+    /// Optional work uses an isolated encoder and cannot poison the live chain.
+    private func invalidateReferenceChain(_ reservation: EncodeReservation) {
+        guard pipelineGeneration == reservation.generation,
+              !reservation.submission.isRefinement else { return }
+        if reservation.requiresIDR { keyframeInFlight = false }
+        referenceChainBroken = true
+        forceIDR = true
     }
 
     private func failEncode(
@@ -695,25 +760,28 @@ public final class GFXPipeline: @unchecked Sendable {
             stateLock.unlock()
             return
         }
-        releaseEncodeSlot(reservation)
+        if reservation.submission.isRefinement {
+            stateLock.unlock()
+            releaseEncodeSlotAfterSend(reservation, sent: false, meanSquaredError: nil)
+            RDPLog.gfx.debug("GFX: static refresh unavailable (\(reason)); keeping live encoder")
+            return
+        }
+        let fps = max(constrainedFPSLocked(targetFPS), 1)
+        let retryDelay = frameDropped
+            ? min(Self.h264DropRetryDelayMaximumNanoseconds, 1_000_000_000 / UInt64(fps)) : 0
+        releaseEncodeSlot(reservation, retryAfterNanoseconds: retryDelay)
 
         if frameDropped {
             if reservation.requiresIDR {
                 keyframeInFlight = false
                 forceIDR = true
             }
-            let fps = max(constrainedFPSLocked(targetFPS), 1)
-            let retryDelay = min(
-                Self.h264DropRetryDelayMaximum,
-                max(1.0 / Double(fps), 1.0 / 60.0)
-            )
-            h264DropResumeNotBefore = Date().addingTimeInterval(retryDelay)
             stateLock.unlock()
 
             controller?.noteEncodeDrop()
             RDPLog.gfx.debug(
                 "GFX: \(reason); retrying H.264 in " +
-                "\(String(format: "%.0f", retryDelay * 1000))ms"
+                "\(retryDelay / 1_000_000)ms"
             )
             return
         }
@@ -726,9 +794,11 @@ public final class GFXPipeline: @unchecked Sendable {
         failures = consecutiveEncodeFailures
         if shouldRecreate {
             pipelineGeneration &+= 1
+            resetFrameState()
             running = false
             surfacesReady = false
             encodesInFlight = 0
+            readyH264Frames.removeAll(keepingCapacity: true)
             needsBootstrapIDR = false
             bootstrapIDRFrameId = nil
             keyframeInFlight = false
@@ -766,16 +836,15 @@ public final class GFXPipeline: @unchecked Sendable {
     /// frame status; encoder and protocol flow control decide whether it can be
     /// submitted now.
     ///
-    /// AVC420 uses NV12 directly when available and otherwise receives a
-    /// GPU-transferred buffer in the source format.
+    /// Capture owns sizing and letterboxing; the encoder never rescales frames.
     @discardableResult
     public func encodeFrame(
         pixelBuffer: CVPixelBuffer,
+        captureSequence: UInt64,
         captureUptimeNanoseconds: UInt64 = 0
     ) -> FrameSubmission {
         let signpost = RDPSignpost.beginGFX("EncodeFrame")
         defer { RDPSignpost.endGFX("EncodeFrame", signpost) }
-        guard pendingH264FrameRequirement() != nil else { return .blocked }
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
         let captureAgeMs: Double
@@ -785,139 +854,141 @@ public final class GFXPipeline: @unchecked Sendable {
         } else {
             captureAgeMs = 0
         }
-        guard var reservation = reserveH264Encode(captureAgeMs: captureAgeMs) else { return .blocked }
-
-        let prepStart = CFAbsoluteTimeGetCurrent()
+        guard let reservation = reserveH264Encode(
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            captureSequence: captureSequence,
+            captureAgeMs: captureAgeMs
+        ) else { return .blocked }
         // Surface/wire = visible size. AVC420 codes at exactly that size.
         let ew = reservation.width
         let eh = reservation.height
-        let codedW = max(h264.width, 1)
-        let codedH = max(h264.height, 1)
-        let encodePB: CVPixelBuffer
-        if sourceWidth == codedW, sourceHeight == codedH {
-            // Zero-copy: capture already matches the VT session geometry.
-            encodePB = pixelBuffer
-        } else {
-            // Capture geometry does not match the session: one GPU transfer.
-            let scaling: PixelBufferTransfer.Scaling =
-                DisplayContentLayout.aspectsDiffer(
-                    sourceWidth, sourceHeight, codedW, codedH
-                ) ? .letterbox : .fill
-            let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-            guard let fitted = pixelTransfer.transfer(
-                pixelBuffer, width: codedW, height: codedH,
-                pixelFormat: format, scaling: scaling
-            ) else {
-                failEncode(reservation, reason: "pixel-buffer transfer")
-                return .blocked
-            }
-            encodePB = fitted
-        }
-        reservation.prepMs = (CFAbsoluteTimeGetCurrent() - prepStart) * 1000
-
         let left: UInt16 = 0
         let top: UInt16 = 0
         let right = UInt16(ew)
         let bottom = UInt16(eh)
 
-        if reservation.useAsync {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            stateLock.lock()
-            guard pipelineGeneration == reservation.generation, encodesInFlight > 0 else {
-                stateLock.unlock()
+        let candidate: H264Encoder?
+        if reservation.submission.isRefinement {
+            let encoder = H264Encoder()
+            encoder.bitrate = reservation.bitrate
+            encoder.expectedFrameRate = reservation.fps
+            do {
+                try encoder.start(width: ew, height: eh)
+                candidate = encoder
+            } catch {
+                failEncode(reservation, reason: String(describing: error))
                 return .blocked
             }
-            stateLock.unlock()
-            let accepted = h264.encodeAsync(
-                pixelBuffer: encodePB
-            ) { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .success(let encoded):
-                    self.sendEncodedFrame(
-                        encoded,
-                        left: left, top: top, right: right, bottom: bottom,
-                        encodeMs: (CFAbsoluteTimeGetCurrent() - t0) * 1000,
-                        reservation: reservation
-                    )
-                case .failure(let error):
-                    if case .timedOut = error {
-                        self.failEncode(reservation, reason: String(describing: error), fatal: true)
-                    } else {
-                        let frameDropped: Bool
-                        if case .frameDropped = error {
-                            frameDropped = true
-                        } else {
-                            frameDropped = false
-                        }
-                        self.failEncode(
-                            reservation,
-                            reason: String(describing: error),
-                            frameDropped: frameDropped
-                        )
-                    }
-                }
-            }
-            if !accepted {
-                failEncode(reservation, reason: "VideoToolbox rejected submission")
-                return .blocked
-            }
-            return .submitted
+        } else {
+            candidate = nil
         }
-
-        let t0 = CFAbsoluteTimeGetCurrent()
         stateLock.lock()
         guard pipelineGeneration == reservation.generation, encodesInFlight > 0 else {
             stateLock.unlock()
+            candidate?.stop()
             return .blocked
         }
+        if let candidate { refinementEncoder = candidate }
+        let encoder = candidate ?? h264
         stateLock.unlock()
-        guard let encoded = h264.encode(
-            pixelBuffer: encodePB
-        ) else {
-            failEncode(reservation, reason: "VideoToolbox returned no sample")
+        let accepted = encoder.encodeAsync(
+            pixelBuffer: pixelBuffer,
+            refinement: reservation.submission.isRefinement
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let encoded):
+                self.queueEncodedFrame(
+                    encoded,
+                    left: left, top: top, right: right, bottom: bottom,
+                    reservation: reservation
+                )
+            case .failure(.timedOut):
+                self.failEncode(reservation, reason: "VideoToolbox timed out", fatal: true)
+            case .failure(let error):
+                let frameDropped: Bool
+                if case .frameDropped = error {
+                    frameDropped = true
+                } else {
+                    frameDropped = false
+                }
+                self.failEncode(
+                    reservation,
+                    reason: String(describing: error),
+                    frameDropped: frameDropped
+                )
+            }
+        }
+        guard accepted else {
+            failEncode(reservation, reason: "VideoToolbox rejected submission")
             return .blocked
         }
-        sendEncodedFrame(
-            encoded,
-            left: left, top: top, right: right, bottom: bottom,
-            encodeMs: (CFAbsoluteTimeGetCurrent() - t0) * 1000,
-            reservation: reservation
-        )
         return .submitted
+    }
+
+    private func queueEncodedFrame(
+        _ encoded: H264Encoder.EncodedAccessUnit,
+        left: UInt16, top: UInt16, right: UInt16, bottom: UInt16,
+        reservation: EncodeReservation
+    ) {
+        stateLock.lock()
+        guard pipelineGeneration == reservation.generation else { stateLock.unlock(); return }
+        readyH264Frames.append(ReadyH264Frame(encoded: encoded,
+            left: left, top: top, right: right, bottom: bottom, reservation: reservation))
+        stateLock.unlock()
+        drainEncodedFrames()
+    }
+
+    /// Completed reference pictures wait in order for actual send credit. The
+    /// retained encode slots bound this queue even when the client stops ACKing.
+    private func drainEncodedFrames() {
+        stateLock.lock()
+        guard !drainingH264Frames else { stateLock.unlock(); return }
+        drainingH264Frames = true
+        stateLock.unlock()
+        while true {
+            stateLock.lock()
+            guard running, surfacesReady, !sendPaused, !sendBlocked,
+                  !readyH264Frames.isEmpty,
+                  !expectsFrameAcknowledgements || ackTracker.count < frameAcknowledgementWindow else {
+                drainingH264Frames = false
+                stateLock.unlock()
+                return
+            }
+            let next = readyH264Frames.removeFirst()
+            stateLock.unlock()
+            sendEncodedFrame(next.encoded,
+                left: next.left, top: next.top, right: next.right, bottom: next.bottom,
+                reservation: next.reservation)
+        }
     }
 
     private func sendEncodedFrame(
         _ encoded: H264Encoder.EncodedAccessUnit,
         left: UInt16, top: UInt16, right: UInt16, bottom: UInt16,
-        encodeMs: Double,
         reservation: EncodeReservation
     ) {
         let signpost = RDPSignpost.beginGFX("SendEncodedFrame")
         defer { RDPSignpost.endGFX("SendEncodedFrame", signpost) }
         let postStart = CFAbsoluteTimeGetCurrent()
         let containsIDR = encoded.isIDR
-        defer { releaseEncodeSlotAfterSend(reservation) }
+        var sent = false
+        defer { releaseEncodeSlotAfterSend(reservation, sent: sent, meanSquaredError: encoded.meanSquaredError) }
 
         stateLock.lock()
         guard pipelineGeneration == reservation.generation, encodesInFlight > 0 else {
-            if pipelineGeneration == reservation.generation {
-                if reservation.requiresIDR { keyframeInFlight = false }
-                referenceChainBroken = true
-                forceIDR = true
-            }
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             return
         }
         if referenceChainBroken, !containsIDR {
-            forceIDR = true
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             return
         }
         guard running, surfacesReady, !sendPaused, !sendBlocked else {
-            if reservation.requiresIDR { keyframeInFlight = false }
-            referenceChainBroken = true
-            forceIDR = true
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             return
         }
@@ -925,18 +996,28 @@ public final class GFXPipeline: @unchecked Sendable {
         stateLock.unlock()
 
         let streamBytes = encoded.bytes
-        if reservation.requiresIDR, !containsIDR {
+        if reservation.submission.isRefinement {
+            let bitrate = controller?.serverQueueDrainBitrate ?? effectiveBitrate
+            let limit = AVCFrameScheduler.refinementByteLimit(bitrate: bitrate)
             stateLock.lock()
-            if pipelineGeneration == reservation.generation {
-                keyframeInFlight = false
-                referenceChainBroken = true
-                forceIDR = true
+            let useful = frameScheduler.shouldSendRefinement(reservation.submission,
+                meanSquaredError: encoded.meanSquaredError, bytes: streamBytes.count, byteLimit: limit)
+            if !useful {
+                invalidateReferenceChain(reservation)
+                stateLock.unlock()
+                RDPLog.gfx.debug("GFX: static refresh skipped — quality not improved or \(streamBytes.count)B exceeds \(limit)B budget")
+                return
             }
             stateLock.unlock()
-            RDPLog.gfx.error("GFX: forced keyframe produced no IDR; dropping frame and retrying")
+        }
+        if reservation.requiresIDR, !containsIDR {
+            stateLock.lock()
+            invalidateReferenceChain(reservation)
+            stateLock.unlock()
+            RDPLog.gfx.error("GFX: forced keyframe produced no IDR; dropping frame")
             return
         }
-        // mac-rdp: fixed QP=22 / quality=100 on the AVC420 metablock.
+        // Non-progressive region metadata does not configure native encoder QP.
         let quality: UInt8 = 100
         let maxAnnexBBytes = ZGFXCompressor.maxSegmentUncompressed - 64
         if streamBytes.count > maxAnnexBBytes {
@@ -956,11 +1037,7 @@ public final class GFXPipeline: @unchecked Sendable {
 
         guard !bitmap.isEmpty else {
             stateLock.lock()
-            if pipelineGeneration == reservation.generation {
-                if reservation.requiresIDR { keyframeInFlight = false }
-                referenceChainBroken = true
-                forceIDR = true
-            }
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             RDPLog.gfx.error("GFX: AVC420 stream construction failed")
             return
@@ -973,21 +1050,17 @@ public final class GFXPipeline: @unchecked Sendable {
             return
         }
         if referenceChainBroken, !containsIDR {
-            forceIDR = true
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             return
         }
         guard running, surfacesReady, !sendPaused, !sendBlocked else {
-            if reservation.requiresIDR { keyframeInFlight = false }
-            referenceChainBroken = true
-            forceIDR = true
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             return
         }
         guard transport != nil else {
-            if reservation.requiresIDR { keyframeInFlight = false }
-            referenceChainBroken = true
-            forceIDR = true
+            invalidateReferenceChain(reservation)
             stateLock.unlock()
             return
         }
@@ -1020,9 +1093,7 @@ public final class GFXPipeline: @unchecked Sendable {
             stateLock.lock()
             if pipelineGeneration == reservation.generation {
                 ackTracker.remove(frameId: outboundFrameId)
-                if reservation.requiresIDR { keyframeInFlight = false }
-                referenceChainBroken = true
-                forceIDR = true
+                invalidateReferenceChain(reservation)
             }
             stateLock.unlock()
             RDPLog.gfx.info("GFX: dropping H.264 frame — video queue is full")
@@ -1043,23 +1114,20 @@ public final class GFXPipeline: @unchecked Sendable {
 
         controller?.noteEncodedFrame(
             bytes: streamBytes.count,
-            fps: effectiveFPS,
-            encodeMs: encodeMs,
+            encodeMs: encoded.timing.latencyMs,
+            encodeBusyIntervalMs: encoded.timing.busyIntervalMs,
+            encoderBacklogged: encoded.timing.backlogged,
             postEncodeMs: postEncodeMs,
-            prepMs: reservation.prepMs,
             captureAgeMs: reservation.captureAgeMs,
             isIDR: containsIDR,
             serverUnacked: ackTracker.count,
             ackWindow: expectsFrameAcknowledgements ? frameAcknowledgementWindow : 0
         )
-        // Async H.264 callbacks include the full submit-to-output latency, which
-        // is the useful throughput signal for the 4K path.
-        controller?.noteEncodePressure()
         consecutiveEncodeFailures = 0
-        h264DropResumeNotBefore = .distantPast
+        sent = true
         noteUnacknowledgedDepth()
         if containsIDR {
-            h264.noteIDR()
+            (refinementEncoder ?? h264).noteIDR()
             referenceChainBroken = false
             if needsBootstrapIDR {
                 needsBootstrapIDR = false
@@ -1232,7 +1300,6 @@ public final class GFXPipeline: @unchecked Sendable {
         rfxEncodeInFlight = false
         controller?.noteEncodedFrame(
             bytes: payload.count,
-            fps: effectiveFPS,
             encodeMs: encodeMs,
             serverUnacked: ackTracker.count,
             ackWindow: expectsFrameAcknowledgements ? frameAcknowledgementWindow : 0
@@ -1248,16 +1315,6 @@ public final class GFXPipeline: @unchecked Sendable {
             "GFX: RFX \(label) frame=\(frame) \(dimensions) " +
             "bytes=\(payload.count) encode=\(String(format: "%.1f", encodeMs))ms"
         )
-    }
-
-    /// Returns false when backpressure drops the frame.
-    /// Flow control decisions live in `VideoTargetController`; this only tracks frame IDs.
-    private func hasOutboundFrameCapacity() -> Bool {
-        applyLiveCaps()
-        if sendBlocked { return false }
-        pollAckWatchdog()
-        if !expectsFrameAcknowledgements { return true }
-        return ackTracker.count < frameAcknowledgementWindow
     }
 
     /// Timeout / recover when FRAME_ACK stalls — safe to call on every encode tick.
@@ -1296,6 +1353,9 @@ public final class GFXPipeline: @unchecked Sendable {
 
     private func applyLiveCaps() {
         guard let controller else { return }
+        frameScheduler.updateBudget(bitrate: controller.targetBitrate,
+            refinementAllowed: controller.allowsStaticRefinement,
+            now: DispatchTime.now().uptimeNanoseconds)
         targetFPS = controller.targetFPS
         h264.updateExpectedFrameRate(constrainedFPSLocked(targetFPS))
         if controller.targetBitrate != targetBitrate {
@@ -1390,6 +1450,7 @@ public final class GFXPipeline: @unchecked Sendable {
                 totalFramesDecoded: totalFramesDecoded
             )
             stateLock.unlock()
+            drainEncodedFrames()
             wake?()
         case 0x0016: // RDPGFX_CMDID_QOEFRAMEACKNOWLEDGE (MS-RDPEGFX 2.2.2.21)
             // QoE is diagnostic feedback, not a FRAME_ACK. It must never clear the
@@ -1519,21 +1580,8 @@ public final class GFXPipeline: @unchecked Sendable {
             )
         }
 
-        // default echoes client flags (v301==0).
-        // Clearing AVC_DISABLED while the client advertised it is not the default.
+        // Confirm the selected capability's flags without changing codec support.
         let confirmFlags = bestFlags
-
-        if selectedCodec.isProgressive {
-            guard Self.supportsProgressive(version: bestVersion, flags: confirmFlags) else {
-                rejectCapability("GFX: selected capability cannot carry CAPROGRESSIVE")
-                return
-            }
-        } else {
-            guard Self.supportsAVC(version: bestVersion, flags: confirmFlags) else {
-                rejectCapability("GFX: selected capability cannot carry AVC")
-                return
-            }
-        }
         activeCodec = selectedCodec
         selectedCapVersion = bestVersion
         selectedCapFlags = confirmFlags
@@ -1545,13 +1593,14 @@ public final class GFXPipeline: @unchecked Sendable {
         pipelineGeneration &+= 1
         surfacesReady = false
         encodesInFlight = 0
+        readyH264Frames.removeAll(keepingCapacity: true)
         rfxEncodeInFlight = false
         queueRFXReset()
         needsBootstrapIDR = false
         bootstrapIDRFrameId = nil
         keyframeInFlight = false
         referenceChainBroken = false
-        h264DropResumeNotBefore = .distantPast
+        resetFrameState()
         resetUnacked()
         lastAckTime = Date()
         forceIDR = false
@@ -1559,7 +1608,6 @@ public final class GFXPipeline: @unchecked Sendable {
         transport?.reset()
         controller?.resetGraphicsChannel()
         controller?.setRFXAdaptiveMode(activeCodec.isProgressive)
-        applyFrameAckWindowForCodecLocked()
         applyLiveCaps()
 
         if selectedCodec.isProgressive {
@@ -1572,9 +1620,6 @@ public final class GFXPipeline: @unchecked Sendable {
             guard startH264Encoder(width: max(width, 1), height: max(height, 1)) else { return }
             RDPLog.gfx.info("GFX: AVC420 enabled ver=0x\(String(bestVersion, radix: 16))")
         }
-
-        controller?.setRFXAdaptiveMode(activeCodec.isProgressive)
-        applyFrameAckWindowForCodecLocked()
 
         emitGraphics([buildCapsConfirm(version: bestVersion, flags: confirmFlags)])
         RDPLog.gfx.info(
@@ -1605,6 +1650,7 @@ public final class GFXPipeline: @unchecked Sendable {
     private func handleH264InitializationFailure(_ error: Error) {
         surfacesReady = false
         running = false
+        notifyStateChanged()
         RDPLog.gfx.error("GFX: H264 encoder initialization failed: \(error)")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.onPipelineFailure?()
@@ -1679,7 +1725,7 @@ public final class GFXPipeline: @unchecked Sendable {
     }
 
     private static func supportsCapabilitySet(version: UInt32, flags: UInt32) -> Bool {
-        guard version != capVersion101, hasValidFlags(version: version, flags: flags) else {
+        guard hasValidFlags(version: version, flags: flags) else {
             return false
         }
         return supportsAVC(version: version, flags: flags)
@@ -1793,9 +1839,7 @@ public final class GFXPipeline: @unchecked Sendable {
             ackLatencyMs: sample.latencyMs,
             unacked: sample.unacked,
             acknowledgedBytes: sample.acknowledgedBytes,
-            acknowledgedFrames: sample.acknowledgedFrameCount,
-            acknowledgementIntervalMs: sample.acknowledgementIntervalMs,
-            isApplicationLimited: sample.isApplicationLimited
+            acknowledgementIntervalMs: sample.acknowledgementIntervalMs
         )
         applyLiveCaps()
     }
@@ -1976,14 +2020,9 @@ public final class GFXPipeline: @unchecked Sendable {
         return pdu
     }
 
-    public func buildCapsConfirm(version: UInt32, flags: UInt32) -> [UInt8] {
+    private func buildCapsConfirm(version: UInt32, flags: UInt32) -> [UInt8] {
         var capsData: [UInt8] = []
-        if version == 0x000A_0100 {
-            // RDPGFX_CAPSET_VERSION101: 16 reserved bytes, all zero.
-            capsData = [UInt8](repeating: 0, count: 16)
-        } else {
-            capsData.appendU32(flags)
-        }
+        capsData.appendU32(flags)
         var capsSet: [UInt8] = []
         capsSet.appendU32(version)
         capsSet.appendU32(UInt32(capsData.count))

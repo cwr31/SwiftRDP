@@ -30,8 +30,4 @@ public enum TPKT {
         return payload
     }
 
-    public static func peekLength(_ buffer: [UInt8]) -> Int? {
-        guard buffer.count >= 4, buffer[0] == version else { return nil }
-        return Int(buffer[2]) << 8 | Int(buffer[3])
-    }
 }

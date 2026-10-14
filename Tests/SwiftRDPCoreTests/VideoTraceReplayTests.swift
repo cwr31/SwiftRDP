@@ -9,7 +9,7 @@ final class VideoTraceReplayTests: XCTestCase {
         )
         let lines = try String(contentsOf: fixtureURL, encoding: .utf8)
             .split(whereSeparator: \.isNewline)
-        let controller = VideoTargetController(bitrate: 20_000_000, fps: 60)
+        let controller = makeMeasuredVideoController(bitrate: 20_000_000, fps: 60)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var maximumNetworkPressure = 0.0

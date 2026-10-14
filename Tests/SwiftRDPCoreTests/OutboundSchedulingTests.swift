@@ -61,7 +61,7 @@ final class OutboundSchedulingTests: XCTestCase {
 
     func testTwoQueuedFramesPauseAdmissionAndRejectAThirdAtomically() throws {
         let session = RDPSession(config: ServerConfig())
-        session.applyVideoBitrate(1_000_000)
+        session.applyVideoQuality(VideoQualitySettings(mode: .custom, customBitrate: 1_000_000))
         let tls = try NIOSSLContext(configuration: .makeClientConfiguration())
         let channel = EmbeddedChannel(handler: NIOInboundHandler(session: session, sslContext: tls))
         defer { _ = try? channel.finish() }

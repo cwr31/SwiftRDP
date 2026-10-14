@@ -18,7 +18,7 @@ final class RememberedSessionSettingsTests: XCTestCase {
     func testSettingsRoundTrip() throws {
         let original = RememberedSessionSettings(
             identity: SessionClientIdentity(clientName: "MacBook", peerAddress: "10.0.0.2"),
-            videoBitrate: 8_000_000,
+            videoQuality: VideoQualitySettings(mode: .ultra),
             videoFPS: 60,
             audioPlaybackDestination: .controller,
             resolution: RememberedResolution(
@@ -35,5 +35,21 @@ final class RememberedSessionSettingsTests: XCTestCase {
             from: JSONEncoder().encode(original)
         )
         XCTAssertEqual(decoded, original)
+    }
+
+    func testAutomaticAndCustomModesRoundTripWithoutInferringFromBitrate() throws {
+        for mode in VideoQualityMode.allCases {
+            let original = RememberedSessionSettings(
+                identity: SessionClientIdentity(clientName: "MacBook", peerAddress: "10.0.0.2"),
+                videoQuality: VideoQualitySettings(mode: mode, customBitrate: 20_000_000),
+                videoFPS: 60,
+                audioPlaybackDestination: .both
+            )
+            let decoded = try JSONDecoder().decode(
+                RememberedSessionSettings.self,
+                from: JSONEncoder().encode(original)
+            )
+            XCTAssertEqual(decoded, original)
+        }
     }
 }

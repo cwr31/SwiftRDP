@@ -16,23 +16,6 @@ extension ByteBuffer {
         guard let v = readInteger(endianness: endian == .little ? .little : .big, as: UInt32.self) else { return nil }
         return v
     }
-
-    mutating func writeUInt16(_ value: UInt16, endian: Endian = .little) {
-        writeInteger(value, endianness: endian == .little ? .little : .big)
-    }
-
-    mutating func writeUInt32(_ value: UInt32, endian: Endian = .little) {
-        writeInteger(value, endianness: endian == .little ? .little : .big)
-    }
-
-    mutating func writeUInt8(_ value: UInt8) {
-        writeInteger(value)
-    }
-
-    mutating func readBytesExact(_ count: Int) -> [UInt8]? {
-        guard readableBytes >= count else { return nil }
-        return readBytes(length: count)
-    }
 }
 
 enum ByteWriter {

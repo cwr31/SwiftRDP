@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import CoreVideo
 import CoreGraphics
 @preconcurrency import Accelerate
@@ -14,72 +15,18 @@ extension RDPSession {
             terminate()
             return
         }
-        let display = manager.sharedVirtualDisplay
-
-        // Pick physical vs virtual from current topology (clamshell → virtual when panel asleep).
-        sessionManager?.refreshHostDisplayMode(reason: "startDesktop")
-        let useVD = usesVirtualDisplay
-        let virtualParams = useVD
-            ? manager.virtualDisplayParameters(
-                clientWidth: clientWidth,
-                clientHeight: clientHeight
-            )
-            : nil
-
-        if useVD, let params = virtualParams {
-            display.createMatching(
-                width: params.pixelWidth,
-                height: params.pixelHeight,
-                preferHiDPI: params.preferHiDPI,
-                logicalWidth: params.logicalWidth,
-                logicalHeight: params.logicalHeight
-            )
-            RDPLog.rdp.info(
-                "Display: Virtual Display source \(params.pixelWidth)x\(params.pixelHeight) " +
-                "for RDP desktop \(clientWidth)x\(clientHeight)" +
-                (params.preferHiDPI ? " HiDPI \(params.logicalWidth)x\(params.logicalHeight)" : "")
-            )
-        } else {
-            if display.active {
-                display.destroy()
-            }
-            applyDesktopSizePolicy(reason: "startDesktop")
-            RDPLog.rdp.info(
-                "Display: physical mirror \(clientWidth)x\(clientHeight)"
-            )
+        manager.refreshHostDisplayMode(reason: "startDesktop")
+        configureHostDisplay(manager)
+        let target: SharedScreenCapture.Target
+        do {
+            target = try captureTarget(for: manager)
+        } catch {
+            RDPLog.rdp.error("Display: capture target unavailable: \(error)")
+            terminate()
+            return
         }
-
-        display.acquireWakeAssertion()
-
-        let captureW: Int
-        let captureH: Int
-        let contentLayout: DisplayContentLayout
-        if useVD {
-            captureW = virtualParams?.pixelWidth ?? clientWidth
-            captureH = virtualParams?.pixelHeight ?? clientHeight
-            contentLayout = DisplayContentLayout.aspectFit(
-                desktopWidth: clientWidth,
-                desktopHeight: clientHeight,
-                sourceWidth: captureW,
-                sourceHeight: captureH
-            )
-        } else {
-            let plan = bindPhysicalMirrorGeometry(reason: "startDesktop")
-            captureW = plan.captureWidth
-            captureH = plan.captureHeight
-            contentLayout = plan.layout
-        }
-
         hideHostCursorIfNeeded()
 
-        if config.asyncEncoding {
-            RDPLog.rdp.info("AsyncEncoding: enabled (encode path uses VT async callbacks)")
-        }
-        gfx.asyncEncoding = config.asyncEncoding
-
-        let displayID: UInt32? = useVD
-            ? (display.displayID == 0 ? nil : display.displayID)
-            : DisplayTopology.physicalDisplayID(preferredIdentity: config.selectedDisplayIdentity)
         sharedCapture.attach(
             owner: id,
             captureFPS: max(videoController.targetFPS, 1),
@@ -97,25 +44,17 @@ extension RDPSession {
                 )
             },
             onDisplayChanged: { [weak self] in
-                self?.syncMouseMapping(reason: "capture display changed")
+                self?.syncInputMapping(reason: "capture display changed")
             },
             onFatalError: { [weak self] error in
                 RDPLog.rdp.error("Capture became unavailable: \(error). Closing session.")
                 self?.terminate()
             }
         )
-        self.captureContentLayout = contentLayout
         resetRFXPending()
         info.width = clientWidth
         info.height = clientHeight
         info.licensed = true
-        input.scaleX = 1
-        input.scaleY = 1
-        input.onUserActivity = { [weak self] in
-            self?.lastActivity = Date()
-            let display = self?.sessionManager?.sharedVirtualDisplay ?? self?.virtualDisplay
-            display?.noteUserActivity()
-        }
         input.keyboard.resetModifiers()
         cursor.onSendFastPath = { [weak self] pdu in
             self?.write(pdu)
@@ -124,36 +63,17 @@ extension RDPSession {
             self?.cursor.requestRefresh()
         }
         cursor.start()
-        syncMouseMapping(reason: "startDesktop")
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            self?.syncMouseMapping(reason: "startDesktop settle")
-        }
+        syncInputMapping(reason: "startDesktop")
         armDVCCapsTimeoutWatchdog()
-
-        if let disp = vcRouter.channel(named: "disp") as? GeometryTracking {
-            disp.onResize = { [weak self] w, h in
-                self?.handleDesktopResize(width: w, height: h)
-            }
-        }
 
         captureTask = Task { [weak self] in
             do {
-                // Give WindowServer / ScreenCaptureKit a beat after CGVirtualDisplay
-                // create+mirror — otherwise SCShareableContent can hang indefinitely.
-                if self?.usesVirtualDisplay == true {
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                    try Task.checkCancellation()
-                }
-                try await sharedCapture.start(
-                    target: SharedScreenCapture.Target(
-                        displayID: displayID,
-                        width: captureW,
-                        height: captureH
-                    )
-                )
+                try await sharedCapture.start(target: target)
                 try Task.checkCancellation()
-                self?.syncMouseMapping(reason: "capture started")
+                self?.executeOnSessionLoop { session in
+                    guard session.phase == .active else { return }
+                    session.syncInputMapping(reason: "capture started")
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -184,14 +104,17 @@ extension RDPSession {
                     if elapsed < periodNs {
                         await self.waitForCaptureWake(timeoutNs: periodNs - elapsed)
                     }
-                } else if self.gfx.isEncodeInFlight || self.gfx.isAckWindowFull {
+                } else if self.gfx.isEncodeWindowFull || self.gfx.isAckWindowFull {
                     // VT completion and FRAME_ACK signal this path directly. Keep a
                     // bounded timeout for TCP send availability and ACK watchdogs.
                     await self.waitForCaptureWake(timeoutNs: 100_000_000)
                 } else {
-                    // No work yet (pipeline not ready / paused / no frame). Wake on
-                    // the next SCKit sample or after one frame period.
-                    let waitNs = elapsed < periodNs ? periodNs - elapsed : periodNs
+                    // Idle AVC work has an explicit retry/refinement deadline.
+                    // Capture, ACK and transport callbacks wake other progress.
+                    let next = self.gfx.nextFrameWaitNanoseconds
+                    let waitNs = self.gfx.activeCodec.isProgressive
+                        ? (elapsed < periodNs ? periodNs - elapsed : periodNs)
+                        : (next.flatMap { $0 > 0 ? $0 : nil } ?? 1_000_000_000)
                     await self.waitForCaptureWake(timeoutNs: waitNs)
                 }
             }
@@ -200,11 +123,8 @@ extension RDPSession {
         startIdleWatchIfNeeded()
     }
 
-    /// Register aligned DVC names ([MS-RDPEDYC] + companion specs).
+    /// Open implemented dynamic channels after the DRDYNVC capability exchange.
     func registerStandardDVCs() {
-        vcRouter.dynamicVC.onCreate(name: DesktopComposition.channelName) { [weak self] _, send in
-            self?.desktopComposition.attach(send: send)
-        }
         vcRouter.dynamicVC.onCreate(name: DisplayControlChannel.dvcName) { [weak self] channelId, send in
             guard let self else { return }
             self.displayControl.attach(send: send)
@@ -215,28 +135,27 @@ extension RDPSession {
                 self?.displayControl.handle(data)
             }
         }
-        vcRouter.dynamicVC.onCreate(name: GeometryDVChannel.dvcName) { [weak self] channelId, send in
-            guard let self else { return }
-            self.geometryDVC.attach(send: send)
-            self.vcRouter.dynamicVC.setDataHandler(channelId: channelId) { [weak self] data in
-                self?.geometryDVC.handle(data)
-            }
-        }
         vcRouter.dynamicVC.onCreate(name: TouchInput.dvcName) { [weak self] channelId, send in
             guard let self else { return }
-            self.touch.scaleX = self.mouse.scaleX
-            self.touch.scaleY = self.mouse.scaleY
-            self.touch.originX = self.mouse.originX
-            self.touch.originY = self.mouse.originY
             self.touch.onUserActivity = { [weak self] in
                 self?.lastActivity = Date()
-                let display = self?.sessionManager?.sharedVirtualDisplay ?? self?.virtualDisplay
-                display?.noteUserActivity()
+                self?.sessionManager?.sharedVirtualDisplay.noteUserActivity()
             }
             self.touch.attach(send: send)
             self.vcRouter.dynamicVC.setDataHandler(channelId: channelId) { [weak self] data in
                 self?.touch.handle(data)
             }
+        }
+        vcRouter.dynamicVC.onCapsExchanged = { [weak self] in
+            guard let self, phase != .terminated else { return }
+            if gfxPipelineEnabled {
+                requestGraphicsCreate(reason: .capsExchanged, delay: 0, countAsStorm: false, coalesce: false)
+            }
+            dvc.createChannel(name: DisplayControlChannel.dvcName)
+            dvc.createChannel(name: TouchInput.dvcName)
+        }
+        if vcRouter.dynamicVC.hasCompletedCapsExchange {
+            vcRouter.dynamicVC.onCapsExchanged?()
         }
     }
 
@@ -258,81 +177,30 @@ extension RDPSession {
         }
     }
 
-    /// Resolve the display whose Quartz bounds map RDP desktop coords → host clicks.
-    private func mouseMappingDisplayID() -> CGDirectDisplayID {
-        let vd = sessionManager?.sharedVirtualDisplay ?? virtualDisplay
-        if usesVirtualDisplay {
-            if vd.active, vd.displayID != 0 { return vd.displayID }
-            if let selected = sharedCapture?.selectedDisplayID, selected != 0 {
-                return CGDirectDisplayID(selected)
-            }
-        } else {
-            if let phys = DisplayTopology.physicalDisplayID(
-                preferredIdentity: config.selectedDisplayIdentity
-            ) {
-                return phys
-            }
-            if let active = sharedCapture?.activeDisplayID, active != 0 {
-                return active
-            }
-            if let selected = sharedCapture?.selectedDisplayID, selected != 0 {
-                return CGDirectDisplayID(selected)
-            }
+    /// Input uses only the layout and display actually resolved by capture.
+    private func syncInputMapping(reason: String) {
+        if let loop = mainEventLoop, !loop.inEventLoop {
+            executeOnSessionLoop { $0.syncInputMapping(reason: reason) }
+            return
         }
-        return CGMainDisplayID()
-    }
-
-    /// Recompute mouse/touch mapping immediately after layout or capture-target changes.
-    private func syncMouseMapping(reason: String, previousLayout: DisplayContentLayout? = nil) {
-        if let previousLayout, previousLayout != captureContentLayout {
-            mouse.noteDesktopGeometryChanged(
-                oldDesktopWidth: previousLayout.desktopWidth,
-                oldDesktopHeight: previousLayout.desktopHeight,
-                newDesktopWidth: captureContentLayout.desktopWidth,
-                newDesktopHeight: captureContentLayout.desktopHeight
-            )
+        guard let capture = sharedCapture,
+              let layout = capture.contentLayout,
+              layout.desktopWidth == clientWidth, layout.desktopHeight == clientHeight,
+              capture.activeDisplayID != 0 else {
+            input.setDesktopMapping(nil)
+            return
         }
-        applyMouseScale()
-        RDPLog.rdp.debug("Mouse mapping synced (\(reason))")
-    }
-
-    /// mouse scale: hostPt = CGDisplayBounds.origin + scale * max(rdp - letterbox, 0).
-    private func applyMouseScale() {
-        let id = mouseMappingDisplayID()
-        let bounds = CGDisplayBounds(id)
-        let layout = captureContentLayout
-        let contentW = CGFloat(max(layout.contentWidth, 1))
-        let contentH = CGFloat(max(layout.contentHeight, 1))
-        let sx = bounds.width / contentW
-        let sy = bounds.height / contentH
-        input.scaleX = sx
-        input.scaleY = sy
-        // stores Quartz origin directly — do not flip to CGEvent top-left.
-        input.originX = bounds.origin.x
-        input.originY = bounds.origin.y
-        mouse.letterboxOffsetX = CGFloat(layout.offsetX)
-        mouse.letterboxOffsetY = CGFloat(layout.offsetY)
-        mouse.contentWidth = contentW
-        mouse.contentHeight = contentH
-        mouse.captureAreaWidth = bounds.width
-        mouse.captureAreaHeight = bounds.height
-        touch.scaleX = sx
-        touch.scaleY = sy
-        touch.originX = bounds.origin.x
-        touch.originY = bounds.origin.y
-        touch.letterboxOffsetX = CGFloat(layout.offsetX)
-        touch.letterboxOffsetY = CGFloat(layout.offsetY)
-        touch.contentWidth = contentW
-        touch.contentHeight = contentH
+        let bounds = CGDisplayBounds(capture.activeDisplayID)
+        guard bounds.width > 0, bounds.height > 0 else {
+            input.setDesktopMapping(nil)
+            return
+        }
+        input.setDesktopMapping(DesktopInputMapping(layout: layout, hostBounds: bounds))
         RDPLog.rdp.info(
-            "Mouse scale (content \(Int(contentW))x\(Int(contentH)) " +
-            "+letterbox(\(layout.offsetX),\(layout.offsetY)) in " +
-            "\(layout.desktopWidth)x\(layout.desktopHeight) → " +
-            "\(Int(bounds.width))x\(Int(bounds.height)) " +
-            "origin=(\(Int(bounds.origin.x)),\(Int(bounds.origin.y)))"
+            "Input mapping (\(reason)): desktop \(clientWidth)x\(clientHeight) " +
+            "content=\(layout.contentRect) host=\(bounds)"
         )
     }
-
 
     /// Wake the desktop loop when any producer can make progress.
     func signalCaptureWake() {
@@ -347,7 +215,7 @@ extension RDPSession {
     /// Returns `true` when encode/send work was started this tick.
     @discardableResult
     private func pushFrameReturningEncoded() -> Bool {
-        guard !outputSuppressed else { return false }
+        guard !outputSuppressed, !captureResizePending else { return false }
 
         switch graphicsPathState {
         case .encodingGFX:
@@ -371,13 +239,7 @@ extension RDPSession {
             guard let snapshot = sharedCapture?.currentFrameSnapshot() else {
                 return false
             }
-            let latest = snapshot.frame
-            var dirty = latest.dirtyRects ?? []
-            if !pendingRefreshRects.isEmpty {
-                dirty.append(contentsOf: pendingRefreshRects)
-                pendingRefreshRects.removeAll(keepingCapacity: true)
-            }
-            let encoded = pushRFXFrame(frame: latest, captureDirty: dirty)
+            let encoded = pushRFXFrame(snapshot: snapshot)
             if encoded {
                 sharedCapture?.markFrameDelivered(
                     sequence: snapshot.sequence,
@@ -390,22 +252,18 @@ extension RDPSession {
         guard config.displayMode == .h264 || config.displayMode == .rfx else { return false }
 
         if let snapshot = sharedCapture?.currentFrameSnapshot() {
-            let hasRefresh = !pendingRefreshRects.isEmpty
-            guard snapshot.sequence != lastH264CaptureSequence
-                    || hasRefresh
-                    || gfx.hasPendingForcedFrame
-            else { return false }
             guard let pb = snapshot.frame.pixelBuffer else { return false }
             switch gfx.encodeFrame(
                 pixelBuffer: pb,
+                captureSequence: snapshot.sequence,
                 captureUptimeNanoseconds: snapshot.frame.captureUptimeNanoseconds
             ) {
             case .submitted:
                 sharedCapture?.markFrameDelivered(
                     sequence: snapshot.sequence,
-                    after: lastH264CaptureSequence
+                    after: lastH264AccountedSequence
                 )
-                lastH264CaptureSequence = snapshot.sequence
+                lastH264AccountedSequence = snapshot.sequence
                 pendingRefreshRects.removeAll(keepingCapacity: true)
                 return true
             case .blocked:
@@ -434,9 +292,8 @@ extension RDPSession {
             self.gfx.preferredCodec = self.config.displayMode == .rfx
                 ? .remoteFXProgressive
                 : .h264AVC420
-            self.gfx.asyncEncoding = self.config.asyncEncoding
             self.gfx.targetFPS = self.config.fps
-            self.gfx.targetBitrate = ServerConfig.normalizedVideoBitrate(self.config.videoBitrate)
+            self.gfx.targetBitrate = self.videoQuality.bitrateCeiling
             self.gfx.attachController(self.videoController)
             self.gfx.attach(
                 transport: RDPGFXDynamicChannelTransport(
@@ -450,7 +307,7 @@ extension RDPSession {
                     }
                 )
             )
-            self.updateGFXTCPBackpressure()
+            self.updateGraphicsBackpressure()
             self.gfx.onWorkAvailable = { [weak self] in
                 self?.signalCaptureWake()
             }
@@ -459,10 +316,16 @@ extension RDPSession {
                 self?.signalCaptureWake()
             }
             self.gfx.onPipelineFailure = { [weak self] in
-                self?.vcRouter.dynamicVC.closeChannel(name: Self.graphicsDVCName)
+                self?.executeOnSessionLoop { session in
+                    guard session.phase != .terminated else { return }
+                    session.vcRouter.dynamicVC.closeChannel(name: Self.graphicsDVCName)
+                }
             }
             self.gfx.onCapabilityFailure = { [weak self] in
-                self?.handleGraphicsCapabilityFailure()
+                self?.executeOnSessionLoop { session in
+                    guard session.phase != .terminated else { return }
+                    session.handleGraphicsCapabilityFailure()
+                }
             }
             self.gfxReady = true
             self.graphicsChannelEverOpened = true
@@ -475,17 +338,19 @@ extension RDPSession {
             }
             do {
                 try self.gfx.start(width: self.clientWidth, height: self.clientHeight)
-                self.updateGFXTCPBackpressure()
+                self.updateGraphicsBackpressure()
                 self.graphicsCloseCount = 0
             } catch {
                 RDPLog.rdp.error("GFX: start failed \(error)")
                 self.gfx.noteChannelCreateFailed("\(error)")
                 self.gfxReady = false
             }
+            self.maybeSwitchGraphicsToUDP()
         }
     }
 
     private func handleGraphicsChannelClosed() {
+        stopMultitransport(recreateGraphics: false)
         let shouldRecreate = gfxPipelineEnabled
         RDPLog.rdp.info(
             shouldRecreate
@@ -523,7 +388,15 @@ extension RDPSession {
         countAsStorm: Bool,
         coalesce: Bool
     ) {
+        if let loop = mainEventLoop, !loop.inEventLoop {
+            executeOnSessionLoop { session in
+                session.requestGraphicsCreate(reason: reason, delay: delay,
+                    countAsStorm: countAsStorm, coalesce: coalesce)
+            }
+            return
+        }
         guard gfxPipelineEnabled, phase != .terminated else { return }
+        if coalesce, graphicsRecreateTask != nil { return }
         if countAsStorm {
             graphicsCloseCount += 1
             if graphicsCloseCount > 5 {
@@ -534,17 +407,9 @@ extension RDPSession {
                 return
             }
         }
-        if coalesce {
-            if graphicsRecreatePending {
-                RDPLog.rdp.info("GFX: create already pending — skip (\(reason.rawValue))")
-                return
-            }
-            graphicsRecreatePending = true
-        }
-
-        let work = { [weak self] in
+        let work: @Sendable () -> Void = { [weak self] in
             guard let self else { return }
-            if coalesce { self.graphicsRecreatePending = false }
+            self.graphicsRecreateTask = nil
             // CAPS may fire before phase == .active; allow any non-terminated session.
             guard self.phase != .terminated, self.gfxPipelineEnabled, !self.gfxReady else {
                 RDPLog.rdp.info(
@@ -561,133 +426,18 @@ extension RDPSession {
 
         if delay <= 0 {
             work()
-        } else {
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay, execute: work)
+        } else if let loop = mainEventLoop {
+            graphicsRecreateTask?.cancel()
+            graphicsRecreateTask = loop.scheduleTask(in: .nanoseconds(Int64(delay * 1_000_000_000)), work)
         }
     }
 
-    /// After Graphics CLOSE — coalesce and recreate (not inline in the close handler).
-    func scheduleGraphicsRecreate() {
-        requestGraphicsCreate(reason: .channelClosed, delay: 0.3, countAsStorm: true, coalesce: true)
-    }
-
-    /// Bind capture size + mouse letterbox for physical-panel mirror.
-    @discardableResult
-    func bindPhysicalMirrorGeometry(reason: String) -> (
-        captureWidth: Int,
-        captureHeight: Int,
-        layout: DisplayContentLayout
-    ) {
-        let phys = VirtualDisplayManager.physicalDisplayPixelSize(
-            preferredIdentity: config.selectedDisplayIdentity
-        )
-        let panelW = max(phys.width & ~1, 2)
-        let panelH = max(phys.height & ~1, 2)
-        let previousLayout = captureContentLayout
-        let plan = DisplayContentLayout.physicalMirrorPlan(
-            desktopWidth: clientWidth,
-            desktopHeight: clientHeight,
-            panelWidth: panelW,
-            panelHeight: panelH
-        )
-        captureContentLayout = plan.layout
-        // Defensive: physicalMirrorPlan may force panel geometry on aspect mismatch.
-        if clientWidth != plan.layout.desktopWidth || clientHeight != plan.layout.desktopHeight {
-            clientWidth = plan.layout.desktopWidth
-            clientHeight = plan.layout.desktopHeight
-        }
-        info.width = clientWidth
-        info.height = clientHeight
-        // Desktop / surface / capture are all panel-native pixels.
-        RDPLog.rdp.info(
-            "Display: \(reason) physical 1:1 capture/encode " +
-            "\(plan.captureWidth)x\(plan.captureHeight)"
-        )
-        syncMouseMapping(reason: reason, previousLayout: previousLayout)
-        return plan
-    }
-
-    /// Client DISP / GeometryTracking resize — Virtual mode follows client;
-    /// physical mirror always stays on 1:1 Retina panel pixels.
-    private func handleDesktopResize(width: Int, height: Int) {
-        let display = sessionManager?.sharedVirtualDisplay ?? virtualDisplay
-
-        if !usesVirtualDisplay {
-            let reqW = max(width & ~1, 2)
-            let reqH = max(height & ~1, 2)
-            let phys = VirtualDisplayManager.physicalDisplayPixelSize(
-                preferredIdentity: config.selectedDisplayIdentity
+    private func configureHostDisplay(_ manager: SessionManager) {
+        let display = manager.sharedVirtualDisplay
+        if manager.usesVirtualDisplay {
+            let params = manager.virtualDisplayParameters(
+                clientWidth: clientWidth, clientHeight: clientHeight
             )
-            let panelW = max(phys.width & ~1, 2)
-            let panelH = max(phys.height & ~1, 2)
-            // Physical policy: ignore client aspect/size and stay on the panel.
-            clientWidth = panelW
-            clientHeight = panelH
-            RDPLog.rdp.info(
-                "DISP: physical 1:1 \(panelW)x\(panelH) " +
-                "(client asked \(reqW)x\(reqH))"
-            )
-            let plan = bindPhysicalMirrorGeometry(reason: "DISP")
-            scheduleCaptureRestart(
-                captureW: plan.captureWidth,
-                captureH: plan.captureHeight
-            )
-            return
-        }
-
-        let w = max(width & ~1, 2)
-        let h = max(height & ~1, 2)
-        let params = sessionManager?.virtualDisplayParameters(
-            clientWidth: w,
-            clientHeight: h
-        ) ?? .native(pixelWidth: w, pixelHeight: h)
-        clientWidth = w
-        clientHeight = h
-        info.width = w
-        info.height = h
-
-        display.createMatching(
-            width: params.pixelWidth,
-            height: params.pixelHeight,
-            preferHiDPI: params.preferHiDPI,
-            logicalWidth: params.logicalWidth,
-            logicalHeight: params.logicalHeight
-        )
-        display.acquireWakeAssertion()
-
-        let previousLayout = captureContentLayout
-        captureContentLayout = DisplayContentLayout.aspectFit(
-            desktopWidth: w,
-            desktopHeight: h,
-            sourceWidth: params.pixelWidth,
-            sourceHeight: params.pixelHeight
-        )
-        syncMouseMapping(reason: "DISP resize", previousLayout: previousLayout)
-        scheduleCaptureRestart(
-            captureW: params.pixelWidth,
-            captureH: params.pixelHeight
-        )
-    }
-
-    /// Live apply from menu bar (Virtual Display) or after physical mode change.
-    func applyHostResolution(width: Int, height: Int) {
-        let captureW: Int
-        let captureH: Int
-        if usesVirtualDisplay {
-            let params = sessionManager?.virtualDisplayParameters(
-                clientWidth: clientWidth,
-                clientHeight: clientHeight
-            ) ?? .native(pixelWidth: clientWidth, pixelHeight: clientHeight)
-            let previousLayout = captureContentLayout
-            captureContentLayout = DisplayContentLayout.aspectFit(
-                desktopWidth: clientWidth,
-                desktopHeight: clientHeight,
-                sourceWidth: params.pixelWidth,
-                sourceHeight: params.pixelHeight
-            )
-            captureW = params.pixelWidth
-            captureH = params.pixelHeight
-            let display = sessionManager?.sharedVirtualDisplay ?? virtualDisplay
             display.createMatching(
                 width: params.pixelWidth,
                 height: params.pixelHeight,
@@ -695,148 +445,99 @@ extension RDPSession {
                 logicalWidth: params.logicalWidth,
                 logicalHeight: params.logicalHeight
             )
-            display.acquireWakeAssertion()
-            syncMouseMapping(reason: "menu resolution", previousLayout: previousLayout)
-            RDPLog.rdp.info(
-                "Display: virtual capture source \(captureW)x\(captureH) " +
-                "for RDP desktop \(clientWidth)x\(clientHeight)"
-            )
-        } else {
-            let plan = bindPhysicalMirrorGeometry(reason: "menu")
-            captureW = plan.captureWidth
-            captureH = plan.captureHeight
+        } else if display.active {
+            display.destroy()
         }
-        scheduleCaptureRestart(captureW: captureW, captureH: captureH)
+        display.acquireWakeAssertion()
     }
 
-    /// Rebind after auto mode flip or physical geometry change.
-    func rebindHostDisplay(reason: String) {
-        guard phase == .active else { return }
-        let display = sessionManager?.sharedVirtualDisplay ?? virtualDisplay
-        applyDesktopSizePolicy(reason: reason)
-
-        let captureW: Int
-        let captureH: Int
-        if usesVirtualDisplay {
-            let params = sessionManager?.virtualDisplayParameters(
-                clientWidth: clientWidth,
-                clientHeight: clientHeight
-            ) ?? .native(pixelWidth: clientWidth, pixelHeight: clientHeight)
-            info.width = clientWidth
-            info.height = clientHeight
-            let previousLayout = captureContentLayout
-            captureContentLayout = DisplayContentLayout.aspectFit(
-                desktopWidth: clientWidth,
-                desktopHeight: clientHeight,
-                sourceWidth: params.pixelWidth,
-                sourceHeight: params.pixelHeight
-            )
-            captureW = params.pixelWidth
-            captureH = params.pixelHeight
-            if usesVirtualDisplay {
-                display.createMatching(
-                    width: params.pixelWidth,
-                    height: params.pixelHeight,
-                    preferHiDPI: params.preferHiDPI,
-                    logicalWidth: params.logicalWidth,
-                    logicalHeight: params.logicalHeight
-                )
-                display.acquireWakeAssertion()
-            }
-            syncMouseMapping(reason: reason, previousLayout: previousLayout)
-        } else {
-            let plan = bindPhysicalMirrorGeometry(reason: reason)
-            captureW = plan.captureWidth
-            captureH = plan.captureHeight
-        }
-
-        if !usesVirtualDisplay {
-            if display.active { display.destroy() }
-            display.acquireWakeAssertion()
-        }
-
-        RDPLog.rdp.info(
-            "Display: rebind \(reason) mode=\(usesVirtualDisplay ? "virtual" : "physical") " +
-            "desktop \(clientWidth)x\(clientHeight) capture \(captureW)x\(captureH)"
+    func captureTarget(for manager: SessionManager) throws -> SharedScreenCapture.Target {
+        let displayID = manager.usesVirtualDisplay
+            ? manager.sharedVirtualDisplay.displayID
+            : DisplayTopology.physicalDisplayID(preferredIdentity: config.selectedDisplayIdentity)
+        guard let displayID, displayID != 0 else { throw ScreenCapturer.CaptureError.noDisplay }
+        return SharedScreenCapture.Target(
+            displayID: displayID, width: clientWidth, height: clientHeight
         )
-        scheduleCaptureRestart(captureW: captureW, captureH: captureH)
     }
 
-    private func scheduleCaptureRestart(captureW: Int, captureH: Int) {
+    func handleDesktopResize(width: Int, height: Int) {
+        let w = max(width & ~1, 2)
+        let h = max(height & ~1, 2)
+        guard w != clientWidth || h != clientHeight else { return }
+        clientWidth = w
+        clientHeight = h
+        info.width = w
+        info.height = h
+        rebindHostDisplay(reason: "DISP resize")
+    }
+
+    /// One path for DISP requests, resolution settings and display topology changes.
+    func rebindHostDisplay(reason: String) {
+        if let loop = mainEventLoop, !loop.inEventLoop {
+            executeOnSessionLoop { $0.rebindHostDisplay(reason: reason) }
+            return
+        }
+        guard phase == .active, let manager = sessionManager else { return }
+        configureHostDisplay(manager)
+        RDPLog.rdp.info(
+            "Display: rebind \(reason) mode=\(manager.hostDisplayMode.rawValue) " +
+            "desktop/capture \(clientWidth)x\(clientHeight)"
+        )
+        scheduleCaptureRestart()
+    }
+
+    private func scheduleCaptureRestart() {
         captureRestartTask?.cancel()
         captureRestartGeneration &+= 1
-        let gen = captureRestartGeneration
-        rfxSuspendEncodeForResize = true
+        let generation = captureRestartGeneration
+        captureResizePending = true
+        input.setDesktopMapping(nil)
         captureRestartTask = Task { [weak self] in
             guard let self else { return }
-            // Debounce rapid DISP spam (orientation + quality picker).
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            guard !Task.isCancelled, gen == self.captureRestartGeneration else { return }
             do {
-                // Resize GFX surface BEFORE capture restart so we never encode a
-                // new capture size into a stale CREATE_SURFACE (freezes RFX when
-                // NV12→BGRA scale also fails).
-                if self.gfxReady {
-                    self.gfx.requestForceIDR(reason: "DISP resize")
-                    do {
-                        try self.gfx.start(width: self.clientWidth, height: self.clientHeight)
-                        self.updateGFXTCPBackpressure()
-                        self.resetRFXPending()
-                        RDPLog.rdp.info("GFX: resize complete \(self.clientWidth)x\(self.clientHeight)")
-                    } catch {
-                        RDPLog.rdp.error("GFX: resize failed: \(error)")
-                        throw error
+                try await Task.sleep(nanoseconds: 200_000_000)
+                let target = try await self.withSessionState { session -> SharedScreenCapture.Target? in
+                    guard session.phase == .active, session.captureRestartGeneration == generation,
+                          let manager = session.sessionManager else { return nil }
+                    let target = try session.captureTarget(for: manager)
+                    // Rebuild surfaces before capture changes geometry; state stays on the TCP loop.
+                    if session.gfxReady {
+                        try session.gfx.start(width: session.clientWidth, height: session.clientHeight)
+                        session.updateGraphicsBackpressure()
+                        session.resetRFXPending()
                     }
+                    return target
                 }
-                guard !Task.isCancelled, gen == self.captureRestartGeneration else { return }
-
-                let displayID: UInt32? = self.usesVirtualDisplay
-                    ? (self.sessionManager?.sharedVirtualDisplay.displayID == 0
-                        ? nil
-                        : self.sessionManager?.sharedVirtualDisplay.displayID)
-                    : DisplayTopology.physicalDisplayID(preferredIdentity: self.config.selectedDisplayIdentity)
-                try await self.sharedCapture?.restart(
-                    target: SharedScreenCapture.Target(
-                        displayID: displayID,
-                        width: captureW,
-                        height: captureH
-                    )
-                )
+                guard let target else { return }
                 try Task.checkCancellation()
-                guard gen == self.captureRestartGeneration else { return }
-                guard self.phase == .active else { throw CancellationError() }
-                RDPLog.rdp.info(
-                    "DISP: screen capture restarted at \(captureW)x\(captureH) " +
-                    "(desktop \(self.clientWidth)x\(self.clientHeight))"
-                )
-                self.syncMouseMapping(reason: "DISP resize complete")
-                if gen == self.captureRestartGeneration {
-                    self.rfxSuspendEncodeForResize = false
+                try await self.sharedCapture?.restart(target: target)
+                try Task.checkCancellation()
+                try await self.withSessionState { session in
+                    guard session.phase == .active, session.captureRestartGeneration == generation else { return }
+                    session.syncInputMapping(reason: "DISP resize complete")
+                    session.captureResizePending = false
+                    session.signalCaptureWake()
+                    RDPLog.rdp.info("DISP: capture restarted at \(target.width)x\(target.height)")
                 }
             } catch is CancellationError {
                 return
             } catch {
-                // Keep the RDP session alive — a failed capture restart should not
-                // kick the client off just for changing resolution.
-                RDPLog.rdp.error("DISP: screen capture restart failed: \(error)")
-                if self.gfxReady {
-                    self.gfx.requestForceIDR(reason: "DISP resize recovery")
-                }
-                self.syncMouseMapping(reason: "DISP resize recovery")
-                if gen == self.captureRestartGeneration {
-                    self.rfxSuspendEncodeForResize = false
+                self.executeOnSessionLoop { session in
+                    guard session.phase == .active, session.captureRestartGeneration == generation else { return }
+                    RDPLog.rdp.error("DISP: capture restart failed: \(error)")
+                    session.terminate()
                 }
             }
         }
     }
 
     /// RFX Progressive:
-    /// 1) Bootstrap / dirty / hash-scan enqueue
+    /// 1) Bootstrap / new capture damage enqueue
     /// 2) Strict per-frame op budget (including TILE_SIMPLE full refresh)
     /// 3) Upgrades only after FIRST queue drains and ACK is healthy
     /// 4) Encode overload skip + latest-frame only
     private static let rfxTileSize = 64
-    private static let rfxHashScanMinIntervalNs: UInt64 = 100_000_000 // 100ms
     /// Steady-state FIRST/UPGRADE/SIMPLE ops per tick.
     private static let rfxOpBudget = 48
     /// Bootstrap TILE_SIMPLE budget (spread full refresh across ticks).
@@ -846,12 +547,9 @@ extension RDPSession {
     /// Only upgrade when the estimated client queue delay is this low or lower.
     private static let rfxUpgradeQueueDelayMs = 80.0
 
-    static func rfxHashScanDue(lastScanNs: UInt64, nowNs: UInt64) -> Bool {
-        lastScanNs == 0 || nowNs &- lastScanNs >= rfxHashScanMinIntervalNs
-    }
-
     func resetRFXPending() {
         lastRFXCaptureSequence = 0
+        lastRFXDamageSequence = 0
         rfxPendingKeys.removeAll(keepingCapacity: true)
         rfxUpgradeKeys.removeAll(keepingCapacity: true)
         rfxTileStages.removeAll(keepingCapacity: true)
@@ -860,19 +558,17 @@ extension RDPSession {
         rfxHashRows = 0
         rfxNeedsFullRefresh = true
         rfxBootstrapSimplePending = false
-        rfxLastHashScanNs = 0
-        rfxLoggedScaleGeometry = nil
     }
 
     /// Returns `true` when an RFX frame was encoded and queued for send.
     @discardableResult
-    private func pushRFXFrame(frame: CapturedFrame, captureDirty: [CGRect]) -> Bool {
-        if rfxSuspendEncodeForResize {
+    func pushRFXFrame(snapshot: FrameHub.Snapshot) -> Bool {
+        if captureResizePending {
             return false
         }
         // RFX encoding is serialized off the capture loop. Do not repeat dirty
-        // hashing, scaling, or tile extraction while that worker owns the slot.
-        if gfx.isEncodeInFlight {
+        // hashing or tile extraction while that worker owns the slot.
+        if gfx.isEncodeWindowFull {
             return false
         }
         if videoController.consumeRFXSkipFrame() {
@@ -882,84 +578,25 @@ extension RDPSession {
             return false
         }
 
-        // SCKit can omit dirty metadata on a virtual display. Keep scanning for
-        // the full session, but avoid scaling every capture sample.
-        if !rfxNeedsFullRefresh, captureDirty.isEmpty, rfxPendingKeys.isEmpty {
-            if rfxUpgradeKeys.isEmpty {
-                let now = DispatchTime.now().uptimeNanoseconds
-                guard Self.rfxHashScanDue(lastScanNs: rfxLastHashScanNs, nowNs: now) else {
-                    return false
-                }
-                rfxLastHashScanNs = now
-            }
-            // else: drain pending upgrades without waiting for the hash-scan interval
-        }
-
-        // Tile grid must match CREATE_SURFACE; without MAP_SCALED (e.g. V8.1),
-        // scale capture → surface first.
-        let sourceWidth = frame.width
-        let sourceHeight = frame.height
+        let frame = snapshot.frame
         let surface = gfx.surfaceEncodeSize
-        guard let prepared = Self.rfxPrepareFrameForSurface(
-            frame: frame,
-            captureDirty: captureDirty,
-            surfaceWidth: surface.width,
-            surfaceHeight: surface.height,
-            transfer: gfx.pixelTransfer
-        ) else {
-            RDPLog.rdp.error(
-                "GFX: RFX cannot scale capture \(frame.width)x\(frame.height) " +
-                "→ surface \(surface.width)x\(surface.height)"
-            )
+        guard frame.width == surface.width, frame.height == surface.height else { return false }
+        var captureDirty = snapshot.dirtyRects(after: lastRFXDamageSequence)
+        if !pendingRefreshRects.isEmpty {
+            captureDirty?.append(contentsOf: pendingRefreshRects)
+        }
+        if !rfxNeedsFullRefresh, captureDirty?.isEmpty == true,
+           rfxPendingKeys.isEmpty, rfxUpgradeKeys.isEmpty {
+            lastRFXDamageSequence = snapshot.sequence
             return false
-        }
-        var frame = prepared.frame
-        let captureDirty = prepared.dirty
-        if prepared.didScale {
-            let changedGeometry = rfxLoggedScaleGeometry?.sourceWidth != sourceWidth
-                || rfxLoggedScaleGeometry?.sourceHeight != sourceHeight
-                || rfxLoggedScaleGeometry?.width != frame.width
-                || rfxLoggedScaleGeometry?.height != frame.height
-            if changedGeometry {
-                rfxLoggedScaleGeometry = (sourceWidth, sourceHeight, frame.width, frame.height)
-                RDPLog.rdp.debug(
-                    "GFX: RFX scaled capture \(sourceWidth)x\(sourceHeight) → " +
-                    "surface \(frame.width)x\(frame.height) " +
-                    "tiles≈\((frame.width + Self.rfxTileSize - 1) / Self.rfxTileSize)x" +
-                    "\((frame.height + Self.rfxTileSize - 1) / Self.rfxTileSize)"
-                )
-            }
-            // Keep mouse letterbox in sync with encode letterbox when aspects differ.
-            if DisplayContentLayout.aspectsDiffer(
-                sourceWidth, sourceHeight, frame.width, frame.height
-            ) {
-                let layout = DisplayContentLayout.aspectFit(
-                    desktopWidth: frame.width,
-                    desktopHeight: frame.height,
-                    sourceWidth: sourceWidth,
-                    sourceHeight: sourceHeight
-                )
-                if layout != captureContentLayout {
-                    captureContentLayout = layout
-                    syncMouseMapping(reason: "encode letterbox")
-                }
-            }
-        }
-
-        // Prefer newest pixels after scale prep (capture may have advanced).
-        if prepared.didScale == false,
-           let newer = sharedCapture?.currentFrame(),
-           newer.pixelBuffer !== frame.pixelBuffer {
-            frame = newer
         }
 
         ensureRFXHashGrid(width: frame.width, height: frame.height)
 
-        var forceSimpleFullQuality = false
+        let forceSimpleFullQuality = rfxNeedsFullRefresh || rfxBootstrapSimplePending
         if rfxNeedsFullRefresh {
             rfxNeedsFullRefresh = false
             rfxBootstrapSimplePending = true
-            forceSimpleFullQuality = true
             rfxUpgradeKeys.removeAll(keepingCapacity: true)
             rfxTileStages.removeAll(keepingCapacity: true)
             for i in rfxTileHashes.indices { rfxTileHashes[i] = 0 }
@@ -968,32 +605,24 @@ extension RDPSession {
                 frame: frame,
                 keys: Self.rfxTileKeys(from: [full], frameWidth: frame.width, frameHeight: frame.height)
             )
-        } else if rfxBootstrapSimplePending {
-            forceSimpleFullQuality = true
-        } else if !captureDirty.isEmpty {
-            enqueueRFXChangedTiles(
-                frame: frame,
-                keys: Self.rfxTileKeys(
-                    from: captureDirty, frameWidth: frame.width, frameHeight: frame.height
+        } else if let captureDirty {
+            if !captureDirty.isEmpty {
+                enqueueRFXChangedTiles(
+                    frame: frame,
+                    keys: Self.rfxTileKeys(
+                        from: captureDirty, frameWidth: frame.width, frameHeight: frame.height
+                    )
                 )
-            )
-        } else if rfxPendingKeys.isEmpty && !rfxUpgradeKeys.isEmpty {
-            // Drain quality upgrades only — avoid a full-grid hash scan every tick.
+            }
         } else {
-            let before = rfxPendingKeys.count
             enqueueRFXChangedTiles(
                 frame: frame,
                 keys: Self.rfxAllTileKeys(frameWidth: frame.width, frameHeight: frame.height)
             )
-            let added = rfxPendingKeys.count - before
-            if added > 0 {
-                RDPLog.rdp.debug("GFX: RFX hash-scan enqueued \(added) changed tiles")
-            }
         }
+        lastRFXDamageSequence = snapshot.sequence
+        pendingRefreshRects.removeAll(keepingCapacity: true)
 
-        // Static desktop with nothing queued — do not burn CPU on upgrades-only churn
-        // when the hash scan found no changes and FIRST queue is empty. Still drain
-        // upgrades when they remain from a prior dirty burst.
         let hasWork = !rfxPendingKeys.isEmpty || !rfxUpgradeKeys.isEmpty
         guard hasWork else { return false }
 
@@ -1119,108 +748,6 @@ extension RDPSession {
             )
         }
         return true
-    }
-
-    /// Scale capture into CREATE_SURFACE geometry when it differs from the desktop.
-    static func rfxPrepareFrameForSurface(
-        frame: CapturedFrame,
-        captureDirty: [CGRect],
-        surfaceWidth: Int,
-        surfaceHeight: Int,
-        transfer: PixelBufferTransfer
-    ) -> (frame: CapturedFrame, dirty: [CGRect], didScale: Bool)? {
-        let sw = max(surfaceWidth, 1)
-        let sh = max(surfaceHeight, 1)
-        if frame.width == sw, frame.height == sh {
-            return (frame, captureDirty, false)
-        }
-        guard let srcPB = frame.pixelBuffer else { return nil }
-        // RFX tiles read packed BGRA.
-        guard let scaledPB = transfer.transfer(
-            srcPB,
-            width: sw,
-            height: sh,
-            pixelFormat: kCVPixelFormatType_32BGRA,
-            scaling: Self.aspectsDiffer(frame.width, frame.height, sw, sh) ? .letterbox : .fill
-        ) else { return nil }
-        let dirty: [CGRect]
-        if Self.aspectsDiffer(frame.width, frame.height, sw, sh) {
-            let layout = DisplayContentLayout.aspectFit(
-                desktopWidth: sw,
-                desktopHeight: sh,
-                sourceWidth: frame.width,
-                sourceHeight: frame.height
-            )
-            dirty = rfxLetterboxDirtyRects(
-                captureDirty,
-                fromWidth: frame.width,
-                fromHeight: frame.height,
-                layout: layout
-            )
-        } else {
-            dirty = rfxScaleDirtyRects(
-                captureDirty,
-                fromWidth: frame.width,
-                fromHeight: frame.height,
-                toWidth: sw,
-                toHeight: sh
-            )
-        }
-        let scaled = CapturedFrame(
-            width: sw,
-            height: sh,
-            bgrBottomUp: [],
-            dirtyRects: dirty,
-            pixelBuffer: scaledPB
-        )
-        return (scaled, dirty, true)
-    }
-
-    static func rfxScaleDirtyRects(
-        _ rects: [CGRect],
-        fromWidth: Int,
-        fromHeight: Int,
-        toWidth: Int,
-        toHeight: Int
-    ) -> [CGRect] {
-        guard fromWidth > 0, fromHeight > 0,
-              fromWidth != toWidth || fromHeight != toHeight
-        else {
-            return rects
-        }
-        let sx = CGFloat(toWidth) / CGFloat(fromWidth)
-        let sy = CGFloat(toHeight) / CGFloat(fromHeight)
-        return rects.map { rect in
-            CGRect(
-                x: rect.origin.x * sx,
-                y: rect.origin.y * sy,
-                width: rect.size.width * sx,
-                height: rect.size.height * sy
-            )
-        }
-    }
-
-    private static func aspectsDiffer(_ aw: Int, _ ah: Int, _ bw: Int, _ bh: Int) -> Bool {
-        DisplayContentLayout.aspectsDiffer(aw, ah, bw, bh)
-    }
-
-    static func rfxLetterboxDirtyRects(
-        _ rects: [CGRect],
-        fromWidth: Int,
-        fromHeight: Int,
-        layout: DisplayContentLayout
-    ) -> [CGRect] {
-        guard fromWidth > 0, fromHeight > 0 else { return rects }
-        let sx = CGFloat(layout.contentWidth) / CGFloat(fromWidth)
-        let sy = CGFloat(layout.contentHeight) / CGFloat(fromHeight)
-        return rects.map { rect in
-            CGRect(
-                x: CGFloat(layout.offsetX) + rect.origin.x * sx,
-                y: CGFloat(layout.offsetY) + rect.origin.y * sy,
-                width: rect.size.width * sx,
-                height: rect.size.height * sy
-            )
-        }
     }
 
     private func ensureRFXHashGrid(width: Int, height: Int) {
@@ -1467,20 +994,12 @@ extension RDPSession {
     /// CAPS timeout → terminate (spec 3.3.2). Bitmap path is only used when there is no Graphics channel.
     func armDVCCapsTimeoutWatchdog() {
         capsTimeoutTask?.cancel()
-        guard gfxPipelineEnabled else { return }
-        let deadline = Date().addingTimeInterval(10)
-        capsTimeoutTask = Task { [weak self] in
-            while let self, !Task.isCancelled, self.phase == .active {
-                if self.vcRouter.dynamicVC.hasCompletedCapsExchange { return }
-                if self.gfxReady { return }
-                if Date() >= deadline {
-                    RDPLog.rdp.info("DVC: CAPS_RSP timeout (>10s) — client doesn't support DVC, terminating session (spec 3.3.2)")
-                    self.terminate()
-                    return
-                }
-                self.vcRouter.dynamicVC.sweepStaleState()
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
+        guard gfxPipelineEnabled, let loop = mainEventLoop else { return }
+        capsTimeoutTask = loop.scheduleTask(in: .nanoseconds(Int64(DynamicVCManager.capsResponseTimeoutNs))) { [weak self] in
+            guard let self, phase == .active, !gfxReady,
+                  !vcRouter.dynamicVC.hasCompletedCapsExchange else { return }
+            RDPLog.rdp.info("DVC: CAPS_RSP timeout (>10s) — terminating session (MS-RDPEDYC 3.3.2)")
+            terminate()
         }
     }
 
@@ -1492,33 +1011,7 @@ extension RDPSession {
         let bitmapMaxTile = 64
         if let frame = sharedCapture?.currentFrame() {
             var frame = frame
-            if frame.width != w || frame.height != h {
-                guard let source = frame.pixelBuffer,
-                      let scaled = gfx.pixelTransfer.transfer(
-                        source,
-                        width: w,
-                        height: h,
-                        pixelFormat: kCVPixelFormatType_32BGRA,
-                        scaling: .letterbox
-                      ),
-                      let bgr = Self.pixelBufferToBGRBottomUp(scaled) else {
-                    RDPLog.rdp.error(
-                        "Slow-path: cannot scale bitmap capture " +
-                        "\(frame.width)x\(frame.height) → \(w)x\(h)"
-                    )
-                    return
-                }
-                // Dirty rectangles are in source coordinates. After a GPU
-                // letterbox transfer, send a full surface instead of reusing
-                // coordinates that no longer describe the wire desktop.
-                frame = CapturedFrame(
-                    width: w,
-                    height: h,
-                    bgrBottomUp: bgr,
-                    dirtyRects: nil,
-                    pixelBuffer: scaled
-                )
-            }
+            guard frame.width == w, frame.height == h else { return }
             if frame.bgrBottomUp.isEmpty, let pb = frame.pixelBuffer {
                 if let bgra = Self.pixelBufferToBGRBottomUp(pb) {
                     frame = CapturedFrame(

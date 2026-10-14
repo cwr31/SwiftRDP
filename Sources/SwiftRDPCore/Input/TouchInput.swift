@@ -8,15 +8,7 @@ public final class TouchInput: @unchecked Sendable {
     public var send: (([UInt8]) -> Void)?
     public var onUserActivity: (() -> Void)?
 
-    /// Coordinate scale into host screen space (same as mouse).
-    public var scaleX: CGFloat = 1
-    public var scaleY: CGFloat = 1
-    public var originX: CGFloat = 0
-    public var originY: CGFloat = 0
-    public var letterboxOffsetX: CGFloat = 0
-    public var letterboxOffsetY: CGFloat = 0
-    public var contentWidth: CGFloat = 0
-    public var contentHeight: CGFloat = 0
+    public var coordinateMapping: DesktopInputMapping?
 
     private var readySent = false
     private var activeContacts: [UInt8: CGPoint] = [:]
@@ -58,15 +50,6 @@ public final class TouchInput: @unchecked Sendable {
         default:
             RDPLog.input.info("TouchInput: unknown eventId=\(eventId)")
         }
-    }
-
-    /// Slow-path / fast-path hooks kept for InputInjector parity (RDPEI is DVC-primary).
-    public func handleSlowPathTouch(_ payload: [UInt8]) {
-        handle(payload)
-    }
-
-    public func handleFastPathTouch(_ data: [UInt8]) {
-        handle(data)
     }
 
     // MARK: - Handshake
@@ -142,7 +125,7 @@ public final class TouchInput: @unchecked Sendable {
     }
 
     private func injectContact(id: UInt8, x: Int, y: Int, flags: UInt32) {
-        let pt = absolutePoint(x: x, y: y)
+        guard let pt = absolutePoint(x: x, y: y) else { return }
         let down = (flags & RDPEI.contactDown) != 0
         let up = (flags & RDPEI.contactUp) != 0
         let update = (flags & RDPEI.contactUpdate) != 0
@@ -178,15 +161,8 @@ public final class TouchInput: @unchecked Sendable {
         }
     }
 
-    private func absolutePoint(x: Int, y: Int) -> CGPoint {
-        let rawX = max(CGFloat(x) - letterboxOffsetX, 0)
-        let rawY = max(CGFloat(y) - letterboxOffsetY, 0)
-        let contentX = contentWidth > 0 ? min(rawX, contentWidth) : rawX
-        let contentY = contentHeight > 0 ? min(rawY, contentHeight) : rawY
-        return CGPoint(
-            x: originX + contentX * scaleX,
-            y: originY + contentY * scaleY
-        )
+    func absolutePoint(x: Int, y: Int) -> CGPoint? {
+        coordinateMapping?.hostPoint(x: x, y: y)
     }
 
     // MARK: - Pen frames (MS-RDPEI RDPINPUT_PEN_EVENT)
@@ -249,7 +225,7 @@ public final class TouchInput: @unchecked Sendable {
         pressure: UInt32,
         inverted: Bool
     ) {
-        let pt = absolutePoint(x: x, y: y)
+        guard let pt = absolutePoint(x: x, y: y) else { return }
         let down = (flags & RDPEI.contactDown) != 0
         let up = (flags & RDPEI.contactUp) != 0
         let update = (flags & RDPEI.contactUpdate) != 0

@@ -163,11 +163,6 @@ public enum MCS {
         return BER.encodeSequence(inner)
     }
 
-    public static func buildErectDomainRequest() -> [UInt8] {
-        // Rarely needed from server; client sends it.
-        [0x04, 0x01, 0x00, 0x01, 0x00]
-    }
-
     public static func buildAttachUserConfirm(userId: UInt16, result: UInt8 = 0) -> [UInt8] {
         // PER: initiator is encoded as (userId - 1001)
         let initiator = userId >= 1001 ? userId - 1001 : userId
@@ -238,7 +233,6 @@ public enum MCS {
         case disconnectProviderUltimatum:
             return data.count
         default:
-            if first == 0x04 { return min(5, data.count) }
             return nil
         }
     }
@@ -263,18 +257,6 @@ public enum MCS {
         case disconnectProviderUltimatum:
             return .disconnect
         default:
-            // try alternate masks used by some clients
-            // NOTE: 0x28 is AttachUserRequest (10<<2) — already handled above via choice.
-            if first == 0x04 { return .erectDomain }
-            if (first & 0xFC) == 0x38, data.count >= 5 {
-                let initiator = UInt16(data[1]) << 8 | UInt16(data[2])
-                let channelId = UInt16(data[3]) << 8 | UInt16(data[4])
-                let userId = initiator < 1001 ? initiator + 1001 : initiator
-                return .channelJoinRequest(userId: userId, channelId: channelId)
-            }
-            if (first & 0xFC) == 0x64 {
-                return parseSendDataRequest(data)
-            }
             RDPLog.rdp.debug("Unknown MCS domain PDU first=0x\(String(first, radix: 16)) choice=\(choice) \(data.hexPreview())")
             return nil
         }

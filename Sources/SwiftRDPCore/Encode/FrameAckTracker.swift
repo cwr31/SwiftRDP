@@ -4,9 +4,7 @@ struct FrameAckSample: Equatable {
     let latencyMs: Double
     let unacked: Int
     let acknowledgedBytes: Int
-    let acknowledgedFrameCount: Int
     let acknowledgementIntervalMs: Double
-    let isApplicationLimited: Bool
 }
 
 /// Tracks GFX frame send times so FRAME_ACK latency is measured from the
@@ -18,7 +16,6 @@ final class FrameAckTracker {
         let enqueuedAtNanoseconds: UInt64
         var sentAtNanoseconds: UInt64
         var bytes: Int
-        let isApplicationLimited: Bool
     }
 
     private var entries: [UInt32: Entry] = [:]
@@ -51,8 +48,7 @@ final class FrameAckTracker {
         entries[frameId] = Entry(
             enqueuedAtNanoseconds: nowNanoseconds,
             sentAtNanoseconds: nowNanoseconds,
-            bytes: max(bytes, 0),
-            isApplicationLimited: entries.isEmpty
+            bytes: max(bytes, 0)
         )
         lock.unlock()
     }
@@ -99,9 +95,6 @@ final class FrameAckTracker {
         let firstSend = acknowledgedIds.compactMap { entries[$0]?.enqueuedAtNanoseconds }.min()
             ?? measured.enqueuedAtNanoseconds
         let intervalStart = max(lastAcknowledgementNanoseconds ?? firstSend, firstSend)
-        let applicationLimited = acknowledgedIds.allSatisfy {
-            entries[$0]?.isApplicationLimited == true
-        }
         for id in acknowledgedIds {
             entries.removeValue(forKey: id)
         }
@@ -116,9 +109,7 @@ final class FrameAckTracker {
             latencyMs: Double(elapsed) / 1_000_000,
             unacked: entries.count,
             acknowledgedBytes: acknowledgedBytes,
-            acknowledgedFrameCount: acknowledgedIds.count,
-            acknowledgementIntervalMs: Double(acknowledgementInterval) / 1_000_000,
-            isApplicationLimited: applicationLimited
+            acknowledgementIntervalMs: Double(acknowledgementInterval) / 1_000_000
         )
     }
 

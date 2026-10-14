@@ -1,7 +1,6 @@
 import Foundation
 
-/// User capture and encode frame-rate target (fps). Adaptive reduction applies
-/// only to the wire/encode cadence; capture stays at this configured rate.
+/// User frame-rate ceiling; capture and encoding follow the adapted target.
 enum VideoFPSPreset: Int, CaseIterable, Identifiable {
     case rate15 = 15
     case rate30 = 30

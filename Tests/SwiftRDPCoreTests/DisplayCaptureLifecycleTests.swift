@@ -1,32 +1,64 @@
+import CoreVideo
+import ScreenCaptureKit
 import XCTest
 @testable import SwiftRDPCore
 
 final class DisplayCaptureLifecycleTests: XCTestCase {
-    func testDisplaySleepErrorDetectsChineseSCKMessage() {
-        let error = NSError(
-            domain: "com.apple.ScreenCaptureKit",
-            code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "找不到任何要捕捉的显示器或窗口"]
-        )
-        XCTAssertTrue(ScreenCapturer.isDisplaySleepError(error))
+    func testUnavailableCaptureSourcesUseNativeErrorCodes() {
+        for code in [SCStreamError.Code.noWindowList, .noDisplayList, .noCaptureSource] {
+            let error = NSError(domain: SCStreamErrorDomain, code: code.rawValue)
+            XCTAssertTrue(ScreenCapturer.isCaptureSourceUnavailable(error))
+        }
     }
 
-    func testDisplaySleepErrorDetectsEnglishDisplayMissing() {
-        let error = NSError(
-            domain: "com.apple.ScreenCaptureKit",
-            code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "Could not find display or window to capture"]
-        )
-        XCTAssertTrue(ScreenCapturer.isDisplaySleepError(error))
+    func testCaptureSourceClassificationChecksTheErrorDomainAndCode() {
+        let unrelated = NSError(domain: "test", code: SCStreamError.Code.noCaptureSource.rawValue)
+        XCTAssertFalse(ScreenCapturer.isCaptureSourceUnavailable(unrelated))
+        let denied = NSError(domain: SCStreamErrorDomain, code: SCStreamError.Code.userDeclined.rawValue)
+        XCTAssertFalse(ScreenCapturer.isCaptureSourceUnavailable(denied))
     }
 
-    func testDisplaySleepErrorIgnoresUnrelatedErrors() {
-        let error = NSError(
-            domain: "test",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "Permission denied"]
+    func testCaptureConfigurationUsesOnlyFullRangeNV12AndBT709() {
+        let config = ScreenCapturer.makeStreamConfiguration(
+            layout: .aspectFit(
+                desktopWidth: 1920, desktopHeight: 1080,
+                sourceWidth: 1920, sourceHeight: 1080
+            ),
+            fps: 60, capturesAudio: true
         )
-        XCTAssertFalse(ScreenCapturer.isDisplaySleepError(error))
+        XCTAssertEqual(config.pixelFormat, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        XCTAssertEqual(config.colorSpaceName, CGColorSpace.itur_709)
+        XCTAssertEqual(config.width, 1920)
+        XCTAssertEqual(config.height, 1080)
+        XCTAssertEqual(config.destinationRect, CGRect(x: 0, y: 0, width: 1920, height: 1080))
+        XCTAssertTrue(config.preservesAspectRatio)
+        XCTAssertEqual(config.minimumFrameInterval.timescale, 60)
+        XCTAssertTrue(config.capturesAudio)
+        XCTAssertFalse(config.showsCursor)
+    }
+
+    func testNativeConfigurationCopiesKeepTheBackgroundColorAlive() throws {
+        let layout = DisplayContentLayout.aspectFit(
+            desktopWidth: 1424, desktopHeight: 700,
+            sourceWidth: 3024, sourceHeight: 1964
+        )
+        for _ in 0..<32 {
+            try autoreleasepool {
+                let configuration = autoreleasepool {
+                    ScreenCapturer.makeStreamConfiguration(
+                        layout: layout, fps: 60, capturesAudio: false
+                    )
+                }
+                // SCStream copies its configuration after the factory returns.
+                let copy = try XCTUnwrap(configuration.copy() as? SCStreamConfiguration)
+                let background = try XCTUnwrap(copy.backgroundColor)
+                XCTAssertEqual(background.alpha, 1)
+                XCTAssertTrue(try XCTUnwrap(background.components).dropLast().allSatisfy { $0 == 0 })
+                XCTAssertEqual(copy.destinationRect, layout.contentRect)
+                XCTAssertEqual(copy.width, 1424)
+                XCTAssertEqual(copy.height, 700)
+            }
+        }
     }
 
     func testDisplayWakeSessionBeginEndIsIdempotent() {

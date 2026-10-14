@@ -7,15 +7,8 @@ struct PermissionsSettingsView: View {
     @State private var accessibilityOK = false
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section {
-                Text(L10n.t(.permissionsIntro))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Section(L10n.t(.permissionsRequired)) {
                 PermissionStatusRow(
                     title: L10n.t(.screenRecording),
                     detail: L10n.t(.screenRecordingDetail),
@@ -32,14 +25,18 @@ struct PermissionsSettingsView: View {
                     PermissionGate.requestAccessibility(prompt: true)
                     PermissionGate.openAccessibilitySettings()
                 }
+            } header: {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(L10n.t(.permissionsIntro))
+                        .font(.callout.weight(.regular))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(L10n.t(.permissionsRequired))
+                }
             }
 
             Section {
                 HStack {
-                    Button(L10n.t(.refresh), systemImage: "arrow.clockwise") {
-                        refresh()
-                    }
-                    Spacer()
                     Label(
                         screenOK && accessibilityOK
                             ? L10n.t(.allPermissionsGranted)
@@ -49,10 +46,14 @@ struct PermissionsSettingsView: View {
                             : "exclamationmark.triangle.fill"
                     )
                     .foregroundStyle(screenOK && accessibilityOK ? .green : .orange)
+                    Spacer()
+                    Button(L10n.t(.refresh), systemImage: "arrow.clockwise") {
+                        refresh()
+                    }
+                    .controlSize(.small)
                 }
             }
         }
-        .formStyle(.grouped)
         .onAppear(perform: refresh)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refresh()
@@ -72,29 +73,37 @@ private struct PermissionStatusRow: View {
     let action: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Label(title, systemImage: granted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(granted ? Color.primary : Color.orange)
-                Spacer()
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(granted ? .green : .orange)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.body.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 12)
+
+            VStack(alignment: .trailing, spacing: 8) {
                 Text(granted ? L10n.t(.granted) : L10n.t(.notGranted))
-                    .font(.subheadline.weight(.semibold))
+                    .font(.callout)
                     .foregroundStyle(granted ? .green : .orange)
-            }
 
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !granted {
-                Button(L10n.t(.openSystemSettings), action: action)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                if !granted {
+                    Button(L10n.t(.openSystemSettings), action: action)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
             }
+            .fixedSize(horizontal: true, vertical: false)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 }
 
@@ -118,15 +127,12 @@ struct GeneralSettingsView: View {
     }
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section(L10n.t(.authentication)) {
-                Toggle(L10n.t(.requireAuthNLA), isOn: $prefs.authEnabled)
-                    .onChange(of: prefs.authEnabled) { _, _ in onRestartNeeded() }
-
-                Text(L10n.t(.authHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $prefs.authEnabled) {
+                    SettingsControlLabel(.requireAuthNLA, detail: .authHelp)
+                }
+                .onChange(of: prefs.authEnabled) { _, _ in onRestartNeeded() }
 
                 LabeledContent(L10n.t(.username)) {
                     TextField(
@@ -135,6 +141,9 @@ struct GeneralSettingsView: View {
                         prompt: Text(L10n.t(.usernamePlaceholder))
                     )
                         .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.leading)
+                        .frame(width: 240)
+                        .accessibilityLabel(L10n.t(.username))
                 }
 
                 LabeledContent(L10n.t(.password)) {
@@ -155,6 +164,8 @@ struct GeneralSettingsView: View {
                             }
                         }
                         .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.leading)
+                        .accessibilityLabel(L10n.t(.password))
 
                         Button {
                             showPassword.toggle()
@@ -162,8 +173,10 @@ struct GeneralSettingsView: View {
                             Image(systemName: showPassword ? "eye.slash" : "eye")
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityLabel(showPassword ? L10n.t(.hidePassword) : L10n.t(.showPassword))
                         .help(showPassword ? L10n.t(.hidePassword) : L10n.t(.showPassword))
                     }
+                    .frame(width: 240)
                 }
 
                 if prefs.authEnabled && credentialsAreEmpty {
@@ -172,14 +185,7 @@ struct GeneralSettingsView: View {
                         .foregroundStyle(.red)
                 }
 
-                HStack(spacing: 10) {
-                    Button(L10n.t(.applyAndRestart), systemImage: "arrow.triangle.2.circlepath") {
-                        prefs.applyCredentialsAndRestart()
-                        onRestartApplied()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(credentialsAreEmpty || !prefs.credentialsDirty)
-
+                HStack(spacing: 12) {
                     if prefs.credentialsDirty {
                         Text(L10n.t(.savedRestartCredentials))
                             .font(.caption)
@@ -189,6 +195,15 @@ struct GeneralSettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+
+                    Spacer(minLength: 12)
+
+                    Button(L10n.t(.applyAndRestart), systemImage: "arrow.triangle.2.circlepath") {
+                        prefs.applyCredentialsAndRestart()
+                        onRestartApplied()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(credentialsAreEmpty || !prefs.credentialsDirty)
                 }
             }
 
@@ -197,6 +212,9 @@ struct GeneralSettingsView: View {
                     TextField("", text: $portText, prompt: Text("3389"))
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.trailing)
+                        .monospacedDigit()
+                        .frame(width: 90)
+                        .accessibilityLabel(L10n.t(.port))
                         .onChange(of: portText) { _, _ in updatePort() }
                 }
 
@@ -218,7 +236,6 @@ struct GeneralSettingsView: View {
                 }
             }
         }
-        .formStyle(.grouped)
         .onAppear { portText = String(prefs.serverPort) }
         .onChange(of: prefs.serverPort) { _, value in
             if portText != String(value) {
@@ -258,12 +275,15 @@ struct SessionSettingsView: View {
     }
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section(L10n.t(.session)) {
                 LabeledContent(L10n.t(.idleTimeout)) {
                     TextField("", text: $timeoutText, prompt: Text("0"))
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.trailing)
+                        .monospacedDigit()
+                        .frame(width: 90)
+                        .accessibilityLabel(L10n.t(.idleTimeout))
                         .onChange(of: timeoutText) { _, _ in updateTimeout() }
                 }
                 if !isTimeoutValid {
@@ -274,60 +294,55 @@ struct SessionSettingsView: View {
             }
 
             Section(L10n.t(.power)) {
-                Toggle(L10n.t(.preventSystemSleep), isOn: $prefs.preventSystemSleep)
-                Text(L10n.t(.preventSystemSleepHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $prefs.preventSystemSleep) {
+                    SettingsControlLabel(.preventSystemSleep, detail: .preventSystemSleepHelp)
+                }
 
-                Toggle(L10n.t(.preventDisplaySleep), isOn: $prefs.preventDisplaySleep)
-                Text(L10n.t(.preventDisplaySleepHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $prefs.preventDisplaySleep) {
+                    SettingsControlLabel(.preventDisplaySleep, detail: .preventDisplaySleepHelp)
+                }
             }
 
-            Section(L10n.t(.remoteSessionSecurity)) {
-                Toggle(
-                    L10n.t(.keepScreenUnlockedWhileConnected),
-                    isOn: $prefs.keepScreenUnlockedWhileConnected
-                )
+            Section {
+                Toggle(isOn: $prefs.keepScreenUnlockedWhileConnected) {
+                    SettingsControlLabel(.keepScreenUnlockedWhileConnected, detail: .keepUnlockedHelp)
+                }
                 .disabled(!hasHostLoginPassword || !prefs.authEnabled || !accessibilityOK)
 
-                Text(L10n.t(.keepUnlockedHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                SecureField(L10n.t(.hostLoginPassword), text: $hostLoginPassword)
-                    .textFieldStyle(.roundedBorder)
+                LabeledContent(L10n.t(.hostLoginPassword)) {
+                    SecureField("", text: $hostLoginPassword)
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.leading)
+                        .frame(width: 240)
+                        .accessibilityLabel(L10n.t(.hostLoginPassword))
+                }
 
                 HStack {
-                    Button(L10n.t(.saveHostLoginPassword), systemImage: "key.fill") {
-                        saveHostLoginPassword()
+                    if let hostLoginPasswordStatus {
+                        Text(hostLoginPasswordStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    .disabled(hostLoginPassword.isEmpty)
+
+                    Spacer(minLength: 12)
 
                     if hasHostLoginPassword {
                         Button(L10n.t(.removeHostLoginPassword), systemImage: "trash") {
                             removeHostLoginPassword()
                         }
                     }
-                }
 
-                Text(L10n.t(.hostLoginPasswordHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if let hostLoginPasswordStatus {
-                    Text(hostLoginPasswordStatus)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Button(L10n.t(.saveHostLoginPassword), systemImage: "key.fill") {
+                        saveHostLoginPassword()
+                    }
+                    .disabled(hostLoginPassword.isEmpty)
                 }
+            } header: {
+                Text(L10n.t(.remoteSessionSecurity))
+            } footer: {
+                SettingsHelpText(.hostLoginPasswordHelp)
             }
         }
-        .formStyle(.grouped)
         .onAppear {
             timeoutText = String(prefs.idleTimeout)
             hasHostLoginPassword = HostUnlockCredentialStore.hasCredential
@@ -379,7 +394,7 @@ struct AudioSettingsView: View {
     @ObservedObject var prefs: AppPreferences
 
     var body: some View {
-        Form {
+        SettingsForm {
             Section {
                 Picker(L10n.t(.audioPlaybackDestination), selection: $prefs.audioPlaybackDestination) {
                     ForEach(AudioPlaybackDestination.allCases) { destination in
@@ -388,13 +403,10 @@ struct AudioSettingsView: View {
                     }
                 }
 
-                Text(L10n.t(.audioPlaybackHelp))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            } footer: {
+                SettingsHelpText(.audioPlaybackHelp)
             }
         }
-        .formStyle(.grouped)
     }
 
     private func title(for destination: AudioPlaybackDestination) -> String {

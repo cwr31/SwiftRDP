@@ -3,32 +3,37 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class SessionManagerTests: XCTestCase {
-    private func makeAudit() throws -> ConnectionAudit {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mhrdp-session-manager-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return ConnectionAudit(directoryURL: directory)
-    }
+    func testStateNotificationsOnlyDescribeTheCurrentAuthenticatedDesktop() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig())
+        let active = RDPSession(config: ServerConfig())
+        let pending = RDPSession(config: ServerConfig())
+        let changed = expectation(description: "Active desktop state changed")
+        changed.assertForOverFulfill = true
+        manager.onSessionStateChanged = {
+            XCTAssertEqual(manager.connectionSnapshot.sessionID, active.id)
+            XCTAssertEqual(manager.connectionSnapshot.audioPlaybackDestination, .host)
+            changed.fulfill()
+        }
 
-    func testRFXHashFallbackContinuesAtRateLimitWithoutInputActivity() {
-        let interval: UInt64 = 100_000_000
-
-        XCTAssertTrue(RDPSession.rfxHashScanDue(lastScanNs: 0, nowNs: 1))
-        XCTAssertFalse(RDPSession.rfxHashScanDue(
-            lastScanNs: 1_000_000_000,
-            nowNs: 1_000_000_000 + interval - 1
-        ))
-        XCTAssertTrue(RDPSession.rfxHashScanDue(
-            lastScanNs: 1_000_000_000,
-            nowNs: 1_000_000_000 + interval
-        ))
+        XCTAssertTrue(manager.registerSession(active))
+        XCTAssertTrue(manager.promoteSession(active))
+        XCTAssertTrue(manager.registerSession(pending))
+        pending.applyAudioPlaybackDestination(.host)
+        active.applyAudioPlaybackDestination(.host)
+        active.applyAudioPlaybackDestination(.host)
+        manager.unregisterSession(active)
+        manager.noteSessionStateChanged(active)
+        wait(for: [changed], timeout: 1)
     }
 
     func testShutdownRequestDenialDoesNotCloseLoggedOnSession() {
         let session = RDPSession(config: ServerConfig())
         var writes = 0
         var closes = 0
-        session.onWrite = { _ in writes += 1 }
+        session.socket.onWriteBatch = { packets, _, _ in
+            writes += packets.count
+            return true
+        }
         session.onClose = { closes += 1 }
 
         session.handleShutdownRequest()
@@ -38,9 +43,9 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertNotEqual(session.phase, .terminated)
     }
 
-    func testNewConnectionReplacesCurrentSession() {
+    func testReplacementDoesNotDisplaceDesktopUntilPromotion() throws {
         let config = ServerConfig()
-        let manager = SessionManager(config: config)
+        let manager = try makeTestSessionManager(config: config)
         let active = RDPSession(config: config)
         let replacement = RDPSession(config: config)
 
@@ -49,12 +54,13 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertTrue(manager.hasActiveSession)
 
         manager.registerSession(replacement)
-        XCTAssertEqual(active.phase, .terminated)
-        XCTAssertFalse(manager.hasActiveSession)
-        XCTAssertEqual(manager.liveClientSnapshot()?.id, replacement.id)
-        XCTAssertEqual(manager.liveClientSnapshot()?.state, .connecting)
+        XCTAssertNotEqual(active.phase, .terminated)
+        XCTAssertTrue(manager.hasActiveSession)
+        XCTAssertEqual(manager.liveClientSnapshot()?.id, active.id)
+        XCTAssertEqual(manager.liveClientSnapshot()?.state, .active)
 
         XCTAssertTrue(manager.promoteSession(replacement))
+        XCTAssertEqual(active.phase, .terminated)
         XCTAssertTrue(manager.hasActiveSession)
         XCTAssertEqual(manager.connectionSnapshot.sessionID, replacement.id)
 
@@ -62,8 +68,82 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertFalse(manager.hasActiveSession)
     }
 
-    func testAuthenticatedSessionLifecycleCallbacks() {
-        let manager = SessionManager(config: ServerConfig())
+    func testFailedHandshakeLeavesAuthenticatedDesktopInPlace() throws {
+        let manager = SessionManager(config: ServerConfig(), audit: try makeTestConnectionAudit())
+        let desktop = RDPSession(config: ServerConfig())
+        let candidate = RDPSession(config: ServerConfig())
+        XCTAssertTrue(manager.registerSession(desktop))
+        XCTAssertTrue(manager.promoteSession(desktop))
+        XCTAssertTrue(manager.registerSession(candidate))
+        manager.noteAuthenticationFailure(session: candidate, userName: "wrong", detail: "Rejected")
+        candidate.terminate()
+        manager.unregisterSession(candidate)
+        XCTAssertTrue(manager.hasActiveSession)
+        XCTAssertEqual(manager.liveClientSnapshot()?.id, desktop.id)
+        XCTAssertNotEqual(desktop.phase, .terminated)
+        XCTAssertFalse(manager.promoteSession(candidate))
+    }
+
+    func testPendingConnectionsAreBoundedAndReleasedOnDisconnect() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig())
+        let candidates = (0..<5).map { _ in RDPSession(config: ServerConfig()) }
+        for candidate in candidates.prefix(4) { XCTAssertTrue(manager.registerSession(candidate)) }
+        XCTAssertFalse(manager.registerSession(candidates[4]))
+        manager.unregisterSession(candidates[0])
+        XCTAssertTrue(manager.registerSession(candidates[4]))
+        XCTAssertNotNil(manager.liveClientSnapshot())
+        XCTAssertFalse(manager.hasActiveSession)
+    }
+
+    func testGraphicsRecoveryAndTerminationRunOnSessionEventLoop() throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let loop = group.next()
+        let session = RDPSession(config: ServerConfig())
+        session.noteMainEventLoop(loop)
+        let created = expectation(description: "One coalesced CREATE on the TCP loop")
+        let closed = expectation(description: "Termination on the TCP loop")
+        try loop.submit {
+            session.gfxPipelineEnabled = true
+            session.dvc.handle(pdu: [0x50, 0, 3, 0])
+            session.dvc.send = { bytes in
+                XCTAssertTrue(loop.inEventLoop)
+                if bytes.first.map({ $0 >> 4 }) == 1 { created.fulfill() }
+            }
+            session.onClose = {
+                XCTAssertTrue(loop.inEventLoop)
+                closed.fulfill()
+            }
+        }.wait()
+        session.requestGraphicsCreate(reason: .channelClosed, delay: 0.02, countAsStorm: true, coalesce: true)
+        session.requestGraphicsCreate(reason: .channelClosed, delay: 0.02, countAsStorm: true, coalesce: true)
+        wait(for: [created], timeout: 1)
+        session.terminate()
+        wait(for: [closed], timeout: 1)
+    }
+
+    func testTerminatingSessionCancelsDelayedGraphicsRecovery() throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let loop = group.next()
+        let session = RDPSession(config: ServerConfig())
+        session.noteMainEventLoop(loop)
+        let created = expectation(description: "No CREATE after termination")
+        created.isInverted = true
+        try loop.submit {
+            session.gfxPipelineEnabled = true
+            session.dvc.handle(pdu: [0x50, 0, 3, 0])
+            session.dvc.send = { bytes in
+                if bytes.first.map({ $0 >> 4 }) == 1 { created.fulfill() }
+            }
+            session.requestGraphicsCreate(reason: .channelClosed, delay: 0.02, countAsStorm: true, coalesce: true)
+            session.terminate()
+        }.wait()
+        wait(for: [created], timeout: 0.05)
+    }
+
+    func testAuthenticatedSessionLifecycleCallbacks() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig())
         let session = RDPSession(config: ServerConfig())
         var started: [UUID] = []
         var ended: [UUID] = []
@@ -78,9 +158,9 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(ended, [session.id])
     }
 
-    func testPromoteRestoresVirtualCaptureResolutionWithoutChangingRDPSize() {
+    func testPromoteRestoresVirtualCaptureResolutionWithoutChangingRDPSize() throws {
         let config = ServerConfig(hostDisplayPolicy: .virtual)
-        let manager = SessionManager(config: config)
+        let manager = try makeTestSessionManager(config: config)
         let session = RDPSession(config: config)
         session.info.clientName = "iPhone"
         session.info.peerAddress = "192.0.2.10"
@@ -90,7 +170,7 @@ final class SessionManagerTests: XCTestCase {
                     clientName: "iPhone",
                     peerAddress: "192.0.2.10"
                 ),
-                videoBitrate: 8_000_000,
+                videoQuality: VideoQualitySettings(mode: .ultra),
                 videoFPS: 60,
                 audioPlaybackDestination: .controller,
                 resolution: RememberedResolution(
@@ -112,10 +192,56 @@ final class SessionManagerTests: XCTestCase {
         XCTAssertEqual(params.pixelHeight, 1080)
         XCTAssertEqual(session.clientWidth, 1024)
         XCTAssertEqual(session.clientHeight, 768)
+        XCTAssertEqual(session.videoController.configuredBitrate, 8_000_000)
+        XCTAssertEqual(manager.connectionSnapshot.videoQuality, VideoQualitySettings(mode: .ultra))
     }
 
-    func testHostCursorRetainRelease() {
-        let manager = SessionManager(config: ServerConfig())
+    func testDefaultVideoTargetsDoNotReplaceActiveClientSettings() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig())
+        let session = RDPSession(config: ServerConfig(videoQuality: VideoQualitySettings(mode: .ultra)))
+        manager.registerSession(session)
+        XCTAssertTrue(manager.promoteSession(session))
+
+        let quality = VideoQualitySettings(mode: .custom, customBitrate: 50_000_000)
+        manager.updateDefaultVideoTargets(quality: quality, fps: 30)
+
+        XCTAssertEqual(manager.config.videoQuality, quality)
+        XCTAssertEqual(manager.config.fps, 30)
+        XCTAssertEqual(session.videoController.configuredBitrate, 8_000_000)
+        XCTAssertEqual(manager.connectionSnapshot.videoQuality, VideoQualitySettings(mode: .ultra))
+        XCTAssertEqual(session.videoController.configuredFPS, 60)
+    }
+
+    func testDefaultVideoTargetsStayWithinSupportedBounds() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig())
+        manager.updateDefaultVideoTargets(
+            quality: VideoQualitySettings(mode: .custom, customBitrate: 500_000), fps: 144
+        )
+        XCTAssertEqual(manager.config.videoQuality.bitrateCeiling, 1_000_000)
+        XCTAssertEqual(manager.config.fps, 60)
+    }
+
+    func testSessionSnapshotPreservesEqualBitrateModesAndCustomBudget() throws {
+        let manager = try makeTestSessionManager()
+        let session = RDPSession(config: ServerConfig())
+        XCTAssertTrue(manager.registerSession(session))
+        XCTAssertTrue(manager.promoteSession(session))
+
+        for mode in [VideoQualityMode.automatic, .original, .custom] {
+            let quality = VideoQualitySettings(mode: mode, customBitrate: 20_000_000)
+            session.applyVideoQuality(quality)
+            XCTAssertEqual(manager.connectionSnapshot.videoQuality, quality)
+            XCTAssertEqual(session.videoController.configuredBitrate, 20_000_000)
+        }
+
+        let quality = VideoQualitySettings(mode: .automatic, customBitrate: 37_000_000)
+        session.applyVideoQuality(quality)
+        XCTAssertEqual(manager.connectionSnapshot.videoQuality, quality)
+        XCTAssertEqual(session.videoController.configuredBitrate, 20_000_000)
+    }
+
+    func testHostCursorRetainRelease() throws {
+        let manager = try makeTestSessionManager(config: ServerConfig())
         XCTAssertEqual(manager.hostCursorHiddenRetainCount, 0)
 
         manager.retainHostCursorHidden()
@@ -134,7 +260,7 @@ final class SessionManagerTests: XCTestCase {
     }
 
     func testOpenPolicyAllowsAllAddressesWithoutRateLimit() throws {
-        let manager = SessionManager(config: ServerConfig(), audit: try makeAudit())
+        let manager = SessionManager(config: ServerConfig(), audit: try makeTestConnectionAudit())
 
         for host in 1...100 {
             let address = try SocketAddress(
@@ -146,7 +272,7 @@ final class SessionManagerTests: XCTestCase {
     }
 
     func testKnownPeersOnlyAllowsAuthenticatedAddress() throws {
-        let audit = try makeAudit()
+        let audit = try makeTestConnectionAudit()
         audit.recordAuthSuccess(peerAddress: "203.0.113.10")
         let manager = SessionManager(
             config: ServerConfig(knownPeersOnly: true),
@@ -163,7 +289,7 @@ final class SessionManagerTests: XCTestCase {
 
     func testKnownPeersOnlyCanBeAppliedLive() throws {
         let address = try SocketAddress(ipAddress: "198.51.100.10", port: 50000)
-        let manager = SessionManager(config: ServerConfig(), audit: try makeAudit())
+        let manager = SessionManager(config: ServerConfig(), audit: try makeTestConnectionAudit())
 
         XCTAssertTrue(manager.allowConnection(from: address))
         manager.applyKnownPeersOnly(true)

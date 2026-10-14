@@ -1,7 +1,6 @@
 import AppKit
 @preconcurrency import ApplicationServices
 import CoreGraphics
-import SwiftRDPCore
 
 /// Screen Recording + Accessibility status and System Settings deep-links.
 enum PermissionGate {
@@ -48,34 +47,6 @@ enum PermissionGate {
         ]
         for s in urls {
             if let u = URL(string: s), NSWorkspace.shared.open(u) { return }
-        }
-    }
-
-    /// First-launch / menu-bar gate: prompt missing permissions and optionally open Settings.
-    @MainActor
-    static func checkOnLaunch(openSettingsIfMissing: Bool = true) {
-        let screenOK = isScreenRecordingTrusted
-        let axOK = isAccessibilityTrusted
-        RDPLog.app.info("Permissions: ScreenRecording=\(screenOK) Accessibility=\(axOK)")
-
-        if !screenOK {
-            _ = requestScreenRecording()
-        }
-        if !axOK {
-            requestAccessibility(prompt: true)
-        }
-
-        guard openSettingsIfMissing, (!screenOK || !axOK) else { return }
-
-        let alert = NSAlert()
-        alert.messageText = L10n.t(.permissionsAlertTitle)
-        alert.informativeText = L10n.t(.permissionsAlertBody)
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: L10n.t(.openSettings))
-        alert.addButton(withTitle: L10n.t(.later))
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            SettingsCoordinator.shared.open(section: .permissions)
         }
     }
 }

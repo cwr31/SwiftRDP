@@ -75,5 +75,10 @@ let package = Package(
                 .copy("Fixtures/real-video-stats.log"),
             ]
         ),
+        .testTarget(
+            name: "SwiftRDPAppTests",
+            dependencies: ["SwiftRDPApp", "SwiftRDPCore"],
+            path: "Tests/SwiftRDPAppTests"
+        ),
     ]
 )

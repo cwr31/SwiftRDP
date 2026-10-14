@@ -14,7 +14,6 @@ public final class VirtualChannelRouter {
     private let config: ServerConfig
     private var channels: [String: VirtualChannel] = [:]
     private var idToName: [UInt16: String] = [:]
-    public var sendToChannel: ((UInt16, [UInt8]) -> Void)?
     public var sendToChannelBatch: ((UInt16, [[UInt8]], RDPSocket.WritePriority, RDPSocket.WriteCompletion?) -> Int?)?
 
     /// Negotiated CHANNEL_CHUNK_LENGTH (server Demand Active default: 16256).
@@ -45,7 +44,6 @@ public final class VirtualChannelRouter {
         "cliprdr",
         "rdpsnd",
         "drdynvc",
-        "disp",
     ]
 
     /// Register default virtual channel handlers (implemented channels only).
@@ -55,13 +53,11 @@ public final class VirtualChannelRouter {
         }
         register(AudioPlayback(playbackEnabled: config.audioPlaybackDestination.sendsToController))
         register(drdynvc)
-        register(GeometryTracking())
     }
 
     /// Register or replace a channel handler.
     public func register(_ channel: VirtualChannel) {
         channels[channel.name] = channel
-        wireSend(channel)
     }
 
     public func channel(named name: String) -> VirtualChannel? {
@@ -79,10 +75,8 @@ public final class VirtualChannelRouter {
         }
         idToName[channelId] = key
         if let ch = channels[key] {
+            wireSend(ch, channelId: channelId)
             ch.onOpen(channelId: channelId)
-        } else if let match = channels.first(where: { key.hasPrefix($0.key.lowercased()) }) {
-            idToName[channelId] = match.key
-            match.value.onOpen(channelId: channelId)
         } else {
             // Still joined for SC_NET ID alignment; inbound PDUs are ignored.
             RDPLog.channels.info("VC bind: placeholder '\(key)' (id=\(channelId))")
@@ -181,34 +175,22 @@ public final class VirtualChannelRouter {
         return accepted
     }
 
-    private func wireSend(_ channel: VirtualChannel) {
-        channel.send = { [weak self, weak channel] body in
-            guard let self, let channel else { return }
-            guard let channelId = self.idToName.first(where: { $0.value == channel.name })?.key else {
-                RDPLog.channels.debug("VC send: '\(channel.name)' not bound")
-                return
-            }
+    private func wireSend(_ channel: VirtualChannel, channelId: UInt16) {
+        let priority: RDPSocket.WritePriority = channel.name == "rdpsnd" ? .audio : .control
+        channel.send = { [weak self] body in
+            guard let self else { return }
             // Channel plugins always send raw channel body; router applies CHANNEL_PDU chunking.
-            for framed in ChannelPDU.chunk(body, chunkSize: self.chunkSize) {
-                self.sendToChannel?(channelId, framed)
-            }
+            _ = self.sendToChannelBatch?(
+                channelId, ChannelPDU.chunk(body, chunkSize: self.chunkSize), priority, nil
+            )
         }
         if let drdynvc = channel as? DrdynvcChannel {
-            drdynvc.sendBatch = { [weak self, weak drdynvc] bodies, priority, onWritten in
-                guard let self, let drdynvc,
-                      let channelId = self.idToName.first(where: { $0.value == drdynvc.name })?.key
-                else { return nil }
+            drdynvc.sendBatch = { [weak self] bodies, priority, onWritten in
+                guard let self, let sendToChannelBatch = self.sendToChannelBatch else { return nil }
                 let framedBodies = bodies.flatMap {
                     ChannelPDU.chunk($0, chunkSize: self.chunkSize)
                 }
-                if let sendToChannelBatch = self.sendToChannelBatch {
-                    return sendToChannelBatch(channelId, framedBodies, priority, onWritten)
-                }
-                for body in framedBodies {
-                    self.sendToChannel?(channelId, body)
-                }
-                onWritten?(DispatchTime.now().uptimeNanoseconds)
-                return framedBodies.reduce(0) { $0 + $1.count }
+                return sendToChannelBatch(channelId, framedBodies, priority, onWritten)
             }
         }
     }

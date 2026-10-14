@@ -2,6 +2,37 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class FrameHubTests: XCTestCase {
+    func testDamageDistinguishesMissingMetadataFromAnUnchangedFrame() throws {
+        let hub = FrameHub()
+        hub.publish(CapturedFrame(width: 2, height: 2, bgrBottomUp: [], dirtyRects: []))
+        let first = try XCTUnwrap(hub.currentFrameSnapshot())
+        XCTAssertNil(first.dirtyRects(after: 0))
+        XCTAssertEqual(first.dirtyRects(after: first.sequence), [])
+
+        hub.publish(CapturedFrame(width: 2, height: 2, bgrBottomUp: [], dirtyRects: []))
+        let unchanged = try XCTUnwrap(hub.currentFrameSnapshot())
+        XCTAssertEqual(unchanged.dirtyRects(after: first.sequence), [])
+
+        hub.publish(CapturedFrame(width: 2, height: 2, bgrBottomUp: []))
+        let unknown = try XCTUnwrap(hub.currentFrameSnapshot())
+        XCTAssertNil(unknown.dirtyRects(after: unchanged.sequence))
+        XCTAssertEqual(unknown.dirtyRects(after: unknown.sequence), [])
+    }
+
+    func testSkippedCaptureSamplesRequireAFullDamageCheck() throws {
+        let hub = FrameHub()
+        hub.publish(CapturedFrame(width: 4, height: 4, bgrBottomUp: []))
+        let first = try XCTUnwrap(hub.currentFrameSnapshot())
+        let dirty = [CGRect(x: 0, y: 0, width: 2, height: 2)]
+        hub.publish(CapturedFrame(width: 4, height: 4, bgrBottomUp: [], dirtyRects: dirty))
+        let next = try XCTUnwrap(hub.currentFrameSnapshot())
+        XCTAssertEqual(next.dirtyRects(after: first.sequence), dirty)
+
+        hub.publish(CapturedFrame(width: 4, height: 4, bgrBottomUp: [], dirtyRects: []))
+        let skipped = try XCTUnwrap(hub.currentFrameSnapshot())
+        XCTAssertNil(skipped.dirtyRects(after: first.sequence))
+    }
+
     func testPublishesLatestFrameAndTracksConsumerSkips() {
         let hub = FrameHub()
         var notifications = 0

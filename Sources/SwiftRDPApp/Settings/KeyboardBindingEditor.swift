@@ -23,9 +23,10 @@ struct KeyboardBindingEditor: View {
                         }
                     }
                 }
+                .controlSize(.small)
             }
 
-            Grid(horizontalSpacing: 5, verticalSpacing: 5) {
+            Grid(horizontalSpacing: 6, verticalSpacing: 6) {
                 GridRow {
                     key(.capsLock, columns: 2)
                     key(.leftShift, columns: 3)
@@ -44,6 +45,8 @@ struct KeyboardBindingEditor: View {
                 }
             }
             .frame(maxWidth: .infinity)
+
+            Divider()
 
             HStack(alignment: .firstTextBaseline) {
                 Text(selectedKey.title)
@@ -67,6 +70,7 @@ struct KeyboardBindingEditor: View {
                     }
                 }
                 .labelsHidden()
+                .accessibilityLabel(L10n.t(.keyboardBindingOutput))
             }
         }
     }
@@ -81,7 +85,7 @@ struct KeyboardBindingEditor: View {
         } label: {
             VStack(spacing: 2) {
                 Text(key.keyCap)
-                    .font(.caption2.weight(.medium))
+                    .font(.system(.caption, design: .rounded).weight(.medium))
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
                 Text(effectiveBinding(for: key).symbol)
@@ -91,11 +95,11 @@ struct KeyboardBindingEditor: View {
             .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
             .contentShape(Rectangle())
             .background(
-                RoundedRectangle(cornerRadius: 5)
+                RoundedRectangle(cornerRadius: 8)
                     .fill(selectedKey == key ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor))
             )
             .overlay {
-                RoundedRectangle(cornerRadius: 5)
+                RoundedRectangle(cornerRadius: 8)
                     .stroke(
                         selectedKey == key ? Color.accentColor : Color(nsColor: .separatorColor),
                         lineWidth: selectedKey == key ? 1.5 : 1
@@ -106,5 +110,6 @@ struct KeyboardBindingEditor: View {
         .gridCellColumns(columns)
         .accessibilityLabel(key.title)
         .accessibilityValue(effectiveBinding(for: key).title)
+        .accessibilityAddTraits(selectedKey == key ? .isSelected : [])
     }
 }

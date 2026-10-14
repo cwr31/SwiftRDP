@@ -12,11 +12,7 @@ final class RememberedSessionStore: @unchecked Sendable {
         self.defaults = defaults
         if let data = defaults.data(forKey: key),
            let decoded = try? JSONDecoder().decode([RememberedSessionSettings].self, from: data) {
-            values = Dictionary(uniqueKeysWithValues: decoded.map {
-                var settings = $0
-                settings.videoBitrate = ServerConfig.normalizedVideoBitrate(settings.videoBitrate)
-                return (settings.id, settings)
-            })
+            values = Dictionary(uniqueKeysWithValues: decoded.map { ($0.id, $0) })
         } else {
             values = [:]
         }
@@ -37,7 +33,7 @@ final class RememberedSessionStore: @unchecked Sendable {
     @discardableResult
     func ensure(
         identity: SessionClientIdentity,
-        defaultBitrate: Int,
+        defaultQuality: VideoQualitySettings,
         defaultFPS: Int,
         defaultAudioDestination: AudioPlaybackDestination
     ) -> RememberedSessionSettings {
@@ -53,7 +49,7 @@ final class RememberedSessionStore: @unchecked Sendable {
         }
         let created = RememberedSessionSettings(
             identity: identity,
-            videoBitrate: defaultBitrate,
+            videoQuality: defaultQuality,
             videoFPS: defaultFPS,
             audioPlaybackDestination: defaultAudioDestination
         )

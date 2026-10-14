@@ -2,6 +2,16 @@ import XCTest
 @testable import SwiftRDPCore
 
 final class ConnectionAuditTests: XCTestCase {
+    func testSessionManagersUseIsolatedAuditStoresInTests() throws {
+        let first = try makeTestSessionManager()
+        let second = try makeTestSessionManager()
+        first.audit.recordAuthSuccess(peerAddress: "192.0.2.10")
+        first.audit.record(peerAddress: "192.0.2.10", outcome: .active)
+        XCTAssertTrue(first.audit.isKnownPeer("192.0.2.10"))
+        XCTAssertFalse(second.audit.isKnownPeer("192.0.2.10"))
+        XCTAssertTrue(second.audit.historyEntries().isEmpty)
+    }
+
     private func tempDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("mhrdp-audit-\(UUID().uuidString)", isDirectory: true)

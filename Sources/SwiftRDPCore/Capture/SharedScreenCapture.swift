@@ -2,11 +2,11 @@ import CoreGraphics
 import CoreVideo
 import Foundation
 
-/// One ScreenCaptureKit stream owned by the current RDP session.
+/// One client-sized ScreenCaptureKit stream owned by the current RDP session.
 ///
-/// Capture is shared at the raw-frame boundary with the server's single session.
-/// Codec state, scaling, frame pacing, acknowledgements, and transport remain
-/// session-local.
+/// Native capture fits the selected source into the negotiated desktop before
+/// publishing NV12 frames. Codec state, pacing, acknowledgements and transport
+/// remain session-local.
 public final class SharedScreenCapture: @unchecked Sendable {
     public struct Target: Equatable, Sendable {
         public let displayID: UInt32?
@@ -57,7 +57,6 @@ public final class SharedScreenCapture: @unchecked Sendable {
         self.frameHub = frameHub
         self.capturer = capturer
 
-        capturer.preferPixelBufferOnly = true
         frameHub.onFrameAvailable = { [weak self] in
             self?.notifyFrameAvailable()
         }
@@ -84,6 +83,10 @@ public final class SharedScreenCapture: @unchecked Sendable {
         capturer.size
     }
 
+    public var contentLayout: DisplayContentLayout? {
+        capturer.contentLayout
+    }
+
     public var isRunning: Bool {
         capturer.isCaptureAuthorized
     }
@@ -92,7 +95,7 @@ public final class SharedScreenCapture: @unchecked Sendable {
         frameHub.currentFrame()
     }
 
-    public func currentFrameSnapshot() -> (frame: CapturedFrame, sequence: UInt64)? {
+    public func currentFrameSnapshot() -> FrameHub.Snapshot? {
         frameHub.currentFrameSnapshot()
     }
 
@@ -223,7 +226,6 @@ public final class SharedScreenCapture: @unchecked Sendable {
 
             self.target = target
             capturer.selectedDisplayID = target.displayID
-            capturer.preferPixelBufferOnly = true
             lifecycleGeneration &+= 1
             let generation = lifecycleGeneration
             let task = Task {

@@ -1,23 +1,33 @@
+import AppKit
 import SwiftUI
 
 @main
 struct SwiftRDPApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var prefs = AppPreferences.shared
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarView(prefs: prefs)
-        } label: {
-            Image(systemName: menuBarSymbol)
-                .accessibilityLabel("SwiftRDP")
+        Window("SwiftRDP", id: "settings") {
+            SettingsRootView(prefs: appDelegate.prefs, settings: appDelegate.settings)
+                .onAppear { NSApp.setActivationPolicy(.regular) }
+                .onDisappear { NSApp.setActivationPolicy(.accessory) }
         }
-        .menuBarExtraStyle(.menu)
-    }
-
-    private var menuBarSymbol: String {
-        if prefs.isServerRestarting { return "arrow.triangle.2.circlepath" }
-        if prefs.isServerRunning { return "display.and.arrow.down" }
-        return "display"
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+        .windowResizability(.contentMinSize)
+        .windowToolbarStyle(.unifiedCompact(showsTitle: false))
+        .onChange(of: appDelegate.settings.presentationRequest) {
+            NSApp.setActivationPolicy(.regular)
+            openWindow(id: "settings")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button(L10n.t(.openSettingsEllipsis)) {
+                    appDelegate.settings.requestOpen()
+                }
+                .keyboardShortcut(",")
+            }
+        }
     }
 }

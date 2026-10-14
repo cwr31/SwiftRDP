@@ -38,7 +38,6 @@ public enum SharePDU {
     public static let pdutype2Fontmap: UInt8 = 0x28
     public static let pdutype2Input: UInt8 = 0x1C
     public static let pdutype2Update: UInt8 = 0x02
-    public static let pdutype2Pointer: UInt8 = 0x1B
     public static let pdutype2RefreshRect: UInt8 = 0x21
     public static let pdutype2SuppressOutput: UInt8 = 0x23
     public static let pdutype2ShutdownRequest: UInt8 = 0x24
@@ -78,25 +77,6 @@ public enum SharePDU {
         // Wire: UInt16(pduType | 0x10)
         h.appendU16((type & 0x0F) | 0x10)
         h.appendU16(source)
-        return h
-    }
-
-    public static func shareDataHeader(
-        shareId: UInt32,
-        streamId: UInt8,
-        uncompressedLength: UInt16,
-        pduType2: UInt8,
-        compressedType: UInt8 = 0,
-        compressedLength: UInt16 = 0
-    ) -> [UInt8] {
-        var h: [UInt8] = []
-        h.appendU32(shareId)
-        h.append(0) // pad1
-        h.append(streamId)
-        h.appendU16(uncompressedLength)
-        h.append(pduType2)
-        h.append(compressedType)
-        h.appendU16(compressedLength)
         return h
     }
 
@@ -452,32 +432,6 @@ public enum SharePDU {
         data.appendU32(UInt32(h - 1))
         data.appendU32(1)
         return wrapDataPDU(shareId: shareId, pduType2: pdutype2MonitorLayout, payload: data, source: 0)
-    }
-
-    // MS-RDPBCGR Pointer Update (PDUTYPE2_POINTER = 0x1B)
-    public static let ptrMsgTypeSystem: UInt16 = 0x0001
-    public static let ptrMsgTypePosition: UInt16 = 0x0003
-    public static let ptrMsgTypeColor: UInt16 = 0x0006
-    public static let ptrMsgTypeCached: UInt16 = 0x0007
-    public static let ptrMsgTypePointer: UInt16 = 0x0008
-    public static let sysPtrNull: UInt32 = 0
-    public static let sysPtrDefault: UInt32 = 0x0000_7F00
-
-    /// TS_SYSTEMPOINTERATTRIBUTE — show the default system cursor on the client.
-    public static func buildSystemPointer(shareId: UInt32, systemPointerType: UInt32 = sysPtrDefault) -> [UInt8] {
-        var data: [UInt8] = []
-        data.appendU16(ptrMsgTypeSystem)
-        data.appendU32(systemPointerType)
-        return wrapDataPDU(shareId: shareId, pduType2: pdutype2Pointer, payload: data)
-    }
-
-    /// TS_POINTERPOSATTRIBUTE — client-side cursor position (RDP desktop coords).
-    public static func buildPointerPosition(shareId: UInt32, x: Int, y: Int) -> [UInt8] {
-        var data: [UInt8] = []
-        data.appendU16(ptrMsgTypePosition)
-        data.appendU16(UInt16(clamping: max(0, x)))
-        data.appendU16(UInt16(clamping: max(0, y)))
-        return wrapDataPDU(shareId: shareId, pduType2: pdutype2Pointer, payload: data)
     }
 
     public static func wrapDataPDU(shareId: UInt32, pduType2: UInt8, payload: [UInt8], source: UInt16 = 0x03EA) -> [UInt8] {
